@@ -1529,6 +1529,12 @@ void VKimp_Init( glconfig_t *config )
 }
 
 
+void *GLimp_GetWindowHandle( void )
+{
+	return (void *)g_wv.hWnd;
+}
+
+
 /*
 ** VKimp_Shutdown
 **

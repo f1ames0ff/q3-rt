@@ -22,14 +22,16 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 
 #ifdef USE_LOCAL_HEADERS
 #	include "SDL.h"
-#ifdef USE_VULKAN_API
-#	include "SDL_vulkan.h"
-#endif
+#	include "SDL_syswm.h"
+#	ifdef USE_VULKAN_API
+#		include "SDL_vulkan.h"
+#	endif
 #else
 #	include <SDL.h>
-#ifdef USE_VULKAN_API
-#	include <SDL_vulkan.h>
-#endif
+#	include <SDL_syswm.h>
+#	ifdef USE_VULKAN_API
+#		include <SDL_vulkan.h>
+#	endif
 #endif
 
 #ifdef _WIN32
@@ -683,6 +685,21 @@ Used by opengl renderers to resolve all qgl* function pointers
 void *GL_GetProcAddress( const char *symbol )
 {
 	return SDL_GL_GetProcAddress( symbol );
+}
+
+
+void *GLimp_GetWindowHandle( void )
+{
+#ifdef _WIN32
+	SDL_SysWMinfo info;
+	SDL_VERSION( &info.version );
+	if ( SDL_window != NULL && SDL_GetWindowWMInfo( SDL_window, &info ) && info.subsystem == SDL_SYSWM_WINDOWS ) {
+		return (void *)info.info.win.window;
+	}
+	return NULL;
+#else
+	return (void *)SDL_window;
+#endif
 }
 
 

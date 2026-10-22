@@ -3462,6 +3462,7 @@ static void CL_InitRef( void ) {
 
 	rimp.GLimp_InitGamma = GLimp_InitGamma;
 	rimp.GLimp_SetGamma = GLimp_SetGamma;
+	rimp.GetWindowHandle = GLimp_GetWindowHandle;
 
 	// OpenGL API
 #ifdef USE_OPENGL_API

@@ -1985,6 +1985,12 @@ static qboolean GLW_StartVulkan( void )
 }
 
 
+void *GLimp_GetWindowHandle( void )
+{
+	return NULL;
+}
+
+
 /*
 ** VKimp_Init
 **
