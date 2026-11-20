@@ -5,11 +5,13 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 endif()
 
 set(Q3_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../.." CACHE PATH "Quake 3 source root")
-set(QUAKERAY_SDK_DIR "" CACHE PATH "QuakeRay SDK source directory")
+set(QUAKERAY_SDK_DIR "${Q3_ROOT}/code/quakeraysdk" CACHE PATH "QuakeRay SDK source directory")
 set(QR_NVRHI_SOURCE_DIR "" CACHE PATH "NVRHI source directory")
 
 if(NOT QUAKERAY_SDK_DIR OR NOT EXISTS "${QUAKERAY_SDK_DIR}/CMakeLists.txt")
-    message(FATAL_ERROR "Set QUAKERAY_SDK_DIR to the QuakeRay SDK source tree")
+    message(FATAL_ERROR
+        "QuakeRay SDK is missing at ${QUAKERAY_SDK_DIR}. "
+        "Run `git submodule update --init --recursive`, or set QUAKERAY_SDK_DIR explicitly.")
 endif()
 
 if(NOT QR_NVRHI_SOURCE_DIR OR NOT EXISTS "${QR_NVRHI_SOURCE_DIR}/CMakeLists.txt")
@@ -35,10 +37,7 @@ add_library(rendererqray SHARED
 
 target_compile_features(rendererqray PRIVATE cxx_std_20)
 target_compile_definitions(rendererqray PRIVATE
-    QR_STATIC
-    QR_USE_SURFACE_WIN32
     VK_USE_PLATFORM_WIN32_KHR
-    NOMINMAX
     WIN32_LEAN_AND_MEAN
     _CRT_SECURE_NO_WARNINGS
 )
@@ -48,7 +47,7 @@ target_include_directories(rendererqray PRIVATE
     "${QUAKERAY_SDK_DIR}/Source/Stb"
 )
 target_link_libraries(rendererqray PRIVATE
-    renderer
+    qray::renderer
     user32
 )
 

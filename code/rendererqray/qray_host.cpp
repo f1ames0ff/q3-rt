@@ -32,9 +32,40 @@ refimport_t ri;
 namespace {
 
 constexpr float kPi = 3.14159265358979323846f;
+// QuakeRay's reference host uses 40 Quake units per metre.
+constexpr float kQuakeUnitToMeter = 0.025f;
 constexpr uint32_t kReadbackFormat = QR_FRAME_READBACK_FORMAT_RGBA8_UNORM;
+constexpr uint64_t kDynamicLightUniqueIdBase = 0x100000000ull;
 // Q2_MAX_CLUSTERS of the SDK light list tables.
 constexpr uint32_t kMaxLightClusters = 8192;
+
+float QuakeUnitsToMeters(float value)
+{
+    return value * kQuakeUnitToMeter;
+}
+
+void QuakePositionToMeters(const float source[3], float destination[3])
+{
+    destination[0] = QuakeUnitsToMeters(source[0]);
+    destination[1] = QuakeUnitsToMeters(source[1]);
+    destination[2] = QuakeUnitsToMeters(source[2]);
+}
+
+void QuakePositionToMeters(const float source[3], QrFloat3D &destination)
+{
+    QuakePositionToMeters(source, destination.data);
+}
+
+std::vector<QrVertex> QuakeVerticesToMeters(const std::vector<QrVertex> &source)
+{
+    std::vector<QrVertex> result = source;
+    for (QrVertex &vertex : result) {
+        for (int axis = 0; axis < 3; ++axis) {
+            vertex.position[axis] = QuakeUnitsToMeters(vertex.position[axis]);
+        }
+    }
+    return result;
+}
 
 refexport_t re;
 glconfig_t glConfig;
@@ -48,7 +79,6 @@ cvar_t *qrayConfig = nullptr;
 cvar_t *qraySunColor = nullptr;
 cvar_t *qraySkybox = nullptr;
 cvar_t *qraySkyboxRadius = nullptr;
-cvar_t *qraySunIntensity = nullptr;
 cvar_t *qrayTonemapType = nullptr;
 cvar_t *qrayTonemapPower = nullptr;
 cvar_t *qrayWhitePoint = nullptr;
@@ -63,6 +93,7 @@ cvar_t *qrayLightScale = nullptr;
 cvar_t *qrayLightRadiusScale = nullptr;
 cvar_t *qrayLightRadius = nullptr;
 cvar_t *qrayLightTopUp = nullptr;
+cvar_t *qrayDlightScale = nullptr;
 cvar_t *qrayViewMode = nullptr;
 cvar_t *qrayModelWinding = nullptr;
 cvar_t *qrayCullBackFaces = nullptr;
@@ -73,6 +104,36 @@ cvar_t *qrayTestQuad = nullptr;
 cvar_t *qrayPolyDebug = nullptr;
 cvar_t *qraySkipEntities = nullptr;
 cvar_t *qrayAlphaTest = nullptr;
+cvar_t *qrayGiLevel = nullptr;
+cvar_t *qrayDenoiser = nullptr;
+cvar_t *qrayNeeSamples = nullptr;
+cvar_t *qrayRestir = nullptr;
+cvar_t *qrayRestirCandidates = nullptr;
+cvar_t *qrayCellWorldSize = nullptr;
+cvar_t *qraySunBounceRange = nullptr;
+cvar_t *qrayPhysicalSky = nullptr;
+cvar_t *qrayPhysicalSkySun = nullptr;
+cvar_t *qraySkyColor = nullptr;
+cvar_t *qraySunDiscSize = nullptr;
+cvar_t *qrayClouds = nullptr;
+cvar_t *qrayCloudColor = nullptr;
+cvar_t *qrayCloudCoverage = nullptr;
+cvar_t *qrayCloudDensity = nullptr;
+cvar_t *qrayCloudSpeed = nullptr;
+cvar_t *qrayCloudHeight = nullptr;
+cvar_t *qrayCloudThickness = nullptr;
+cvar_t *qrayCloudOpacity = nullptr;
+cvar_t *qrayCloudQuality = nullptr;
+cvar_t *qrayGodRays = nullptr;
+cvar_t *qrayGodRaysIntensity = nullptr;
+cvar_t *qrayGodRaysQuality = nullptr;
+cvar_t *qrayUncapped = nullptr;
+cvar_t *qrayPhysicalSkySunPitch = nullptr;
+cvar_t *qrayPhysicalSkyYaw = nullptr;
+cvar_t *qrayPhysicalSkyPower = nullptr;
+cvar_t *qraySkyAmbientLod = nullptr;
+cvar_t *qraySkyLightMultiplier = nullptr;
+cvar_t *qrayIndirectHalfRes = nullptr;
 
 QrMaterial defaultMaterial = QR_NO_MATERIAL;
 std::vector<QrMaterial> shaderMaterials;
@@ -85,15 +146,57 @@ struct MapLight
     float radius;
 };
 
+struct DynamicLight
+{
+    float origin[3];
+    float color[3];
+    float radius;
+    bool additive;
+    bool linear;
+};
+
 struct GeometryBatch
 {
     QrMaterial material = QR_NO_MATERIAL;
     bool alphaTested = false;
     std::vector<QrVertex> vertices;
+    // Parallel to vertices. The renderer batches by shader, so triangles from many BSP
+    // surfaces share one upload. The debug picker still needs the original dsurface_t.
+    std::vector<int32_t> sourceSurfaceIndices;
     std::vector<uint32_t> indices;
 };
 
+struct WorldSurfaceInfo
+{
+    bool valid = false;
+    int shaderNum = -1;
+    int surfaceType = MST_BAD;
+    int surfaceFlags = 0;
+    int contentFlags = 0;
+    int firstVert = 0;
+    int numVerts = 0;
+    int firstIndex = 0;
+    int numIndexes = 0;
+    int lightmapNum = 0;
+    int lightmapWidth = 0;
+    int lightmapHeight = 0;
+    int patchWidth = 0;
+    int patchHeight = 0;
+    float planeDist = 0.0f;
+    float planeNormal[3] = {0.0f, 0.0f, 0.0f};
+    float generatedNormal[3] = {0.0f, 0.0f, 0.0f};
+    float authoredNormal[3] = {0.0f, 0.0f, 0.0f};
+    float originalWindingNormal[3] = {0.0f, 0.0f, 0.0f};
+    float uploadedWindingNormal[3] = {0.0f, 0.0f, 0.0f};
+    bool alphaTested = false;
+    bool windingFlipped = false;
+    bool planarWindingKept = false;
+};
+
 std::vector<MapLight> mapLights;
+std::vector<DynamicLight> dynamicLights;
+std::vector<WorldSurfaceInfo> worldSurfaceInfos;
+std::vector<std::string> worldShaderNames;
 
 struct BspClusterTree
 {
@@ -190,6 +293,45 @@ struct SkinAsset
     std::unordered_map<std::string, std::string> shaderBySurface;
 };
 
+enum ShaderWaveType
+{
+    SHADER_WAVE_NONE,
+    SHADER_WAVE_SIN,
+    SHADER_WAVE_SQUARE,
+    SHADER_WAVE_TRIANGLE,
+    SHADER_WAVE_SAWTOOTH,
+    SHADER_WAVE_INVERSE_SAWTOOTH,
+    SHADER_WAVE_NOISE
+};
+
+struct ShaderStage
+{
+    std::string map;
+    std::vector<std::string> animationMaps;
+    float animationFps = 0.0f;
+    QrGeometryMaterialBlendType blend = QR_GEOMETRY_MATERIAL_BLEND_TYPE_OPAQUE;
+    QrBlendFactor blendSrc = QR_BLEND_FACTOR_ONE;
+    QrBlendFactor blendDst = QR_BLEND_FACTOR_ZERO;
+    bool blended = false;
+    bool darkenDecal = false;
+    bool alphaTested = false;
+    bool environmentMap = false;
+    bool lightmap = false;
+    bool dynamic = false;
+    bool animated = false;
+    float scroll[2] = {0.0f, 0.0f};
+    ShaderWaveType rgbWave = SHADER_WAVE_NONE;
+    float rgbWaveBase = 1.0f;
+    float rgbWaveAmplitude = 0.0f;
+    float rgbWavePhase = 0.0f;
+    float rgbWaveFrequency = 0.0f;
+    ShaderWaveType alphaWave = SHADER_WAVE_NONE;
+    float alphaWaveBase = 1.0f;
+    float alphaWaveAmplitude = 0.0f;
+    float alphaWavePhase = 0.0f;
+    float alphaWaveFrequency = 0.0f;
+};
+
 struct ShaderDefinition
 {
     std::string map;
@@ -201,6 +343,12 @@ struct ShaderDefinition
     // The chosen stage is a tcGen environment pass, so its texcoords come from the eye
     // reflection vector instead of the surface UVs.
     bool environmentMap = false;
+    bool usesOverlay = false;
+    bool dynamic = false;
+    bool transparentSurface = false;
+    bool tracedBase = false;
+    size_t baseStageIndex = static_cast<size_t>(-1);
+    std::vector<ShaderStage> stages;
 };
 
 // Q3 skies are either a six sided box (skyparms <box> ...) or a stack of scrolling
@@ -234,6 +382,16 @@ std::unordered_map<qhandle_t, QrMaterial> uiMaterialsRaw;
 std::unordered_map<std::string, bool> textureHasAlpha;
 std::unordered_map<std::string, ShaderDefinition> shaderDefinitions;
 std::unordered_map<std::string, SkyShaderInfo> skyShaders;
+
+struct WorldOverlayBatch
+{
+    std::string shaderName;
+    std::vector<QrVertex> vertices;
+    std::vector<uint32_t> indices;
+};
+
+std::vector<WorldOverlayBatch> worldOverlayBatches;
+
 std::string mapSkyShaderName;
 QrCubemap skyCubemap = QR_EMPTY_CUBEMAP;
 float skyAverageColor[3] = {0.20f, 0.25f, 0.35f};
@@ -259,6 +417,10 @@ struct MarkTriangle
 {
     float points[3][3] = {};
     float normal[3] = {0.0f, 0.0f, 1.0f};
+    float texCoords[3][2] = {};
+    float vertexNormals[3][3] = {};
+    int32_t sourceSurfaceIndex = -1;
+    uint32_t sourceTriangleIndex = 0;
 };
 
 std::vector<MarkTriangle> markTriangles;
@@ -282,6 +444,8 @@ bool sceneValid = false;
 bool sceneRendered = false;
 bool frameHasWorldScene = false;
 refdef_t sceneDef;
+refdef_t probeSceneDef;
+bool probeSceneValid = false;
 std::string pendingWorldName;
 bool worldLoaded = false;
 float worldMin[3] = {1.0e30f, 1.0e30f, 1.0e30f};
@@ -309,6 +473,10 @@ bool hostLogEnabled = false;
 
 void QrayScreenshot_f();
 void QrayReadbackDump_f();
+void QrayProbe_f();
+bool RayIntersectsTriangle(const MarkTriangle &triangle, const float origin[3],
+    const float direction[3], float maxDistance, float &hitDistance,
+    float *outU, float *outV);
 
 void HostLog(const char *format, ...)
 {
@@ -335,6 +503,64 @@ void HostLog(const char *format, ...)
     va_end(args);
 
     stream << message << "\n";
+}
+
+const char *ProbeLogPath()
+{
+    static char path[MAX_PATH] = {};
+    if (path[0] != '\0') {
+        return path;
+    }
+
+    DWORD length = GetTempPathA(MAX_PATH, path);
+    if (length == 0 || length + 16 >= MAX_PATH) {
+        path[0] = '\0';
+        return path;
+    }
+    std::strcat(path, "qray_probe.log");
+    return path;
+}
+
+void ProbeLog(const char *format, ...)
+{
+    const char *path = ProbeLogPath();
+    if (path[0] == '\0') {
+        return;
+    }
+
+    std::ofstream stream(path, std::ios::app);
+    if (!stream.is_open()) {
+        return;
+    }
+
+    char message[4096] = {};
+    va_list args;
+    va_start(args, format);
+    std::vsnprintf(message, sizeof(message), format, args);
+    va_end(args);
+
+    SYSTEMTIME now{};
+    GetLocalTime(&now);
+    char timestamp[64] = {};
+    std::snprintf(timestamp, sizeof(timestamp), "%04u-%02u-%02uT%02u:%02u:%02u.%03u",
+        now.wYear, now.wMonth, now.wDay, now.wHour, now.wMinute, now.wSecond, now.wMilliseconds);
+    stream << timestamp << " " << message << "\n";
+}
+
+const char *SurfaceTypeName(int surfaceType)
+{
+    switch (surfaceType) {
+    case MST_PLANAR:
+        return "PLANAR";
+    case MST_PATCH:
+        return "PATCH";
+    case MST_TRIANGLE_SOUP:
+        return "TRIANGLE_SOUP";
+    case MST_FLARE:
+        return "FLARE";
+    default:
+        return "BAD";
+    }
 }
 
 int HostExceptionFilter(EXCEPTION_POINTERS *exceptionInfo)
@@ -366,6 +592,25 @@ const char *CvarText(cvar_t *cvar, const char *fallback)
 float CvarFloat(cvar_t *cvar, float fallback)
 {
     return cvar != nullptr ? cvar->value : fallback;
+}
+
+void CvarColor(cvar_t *cvar, const float fallback[3], QrFloat3D &color)
+{
+    color.data[0] = fallback[0];
+    color.data[1] = fallback[1];
+    color.data[2] = fallback[2];
+    if (cvar == nullptr || cvar->string == nullptr || cvar->string[0] == '\0') {
+        return;
+    }
+
+    float parsed[3] = {};
+    if (std::sscanf(cvar->string, "%f %f %f", &parsed[0], &parsed[1], &parsed[2]) == 3) {
+        const bool usesByteRange = parsed[0] > 1.0f || parsed[1] > 1.0f || parsed[2] > 1.0f;
+        const float scale = usesByteRange ? 1.0f / 255.0f : 1.0f;
+        color.data[0] = std::clamp(parsed[0] * scale, 0.0f, 1.0f);
+        color.data[1] = std::clamp(parsed[1] * scale, 0.0f, 1.0f);
+        color.data[2] = std::clamp(parsed[2] * scale, 0.0f, 1.0f);
+    }
 }
 
 void CopyString(char *destination, const char *source, size_t size)
@@ -472,9 +717,6 @@ void RegisterCvars()
     ri.Cvar_SetDescription(qraySunColor,
         "QuakeRay directional light color; empty uses the q3map_sun of the map.");
 
-    qraySunIntensity = ri.Cvar_Get("qray_sunIntensity", "3.0", CVAR_ARCHIVE);
-    ri.Cvar_SetDescription(qraySunIntensity, "QuakeRay directional light intensity.");
-
     // The SDK only applies a tonemap operator when the draw info carries the parameters, so
     // without these it falls back to a white point of one and clips every highlight.
     qrayTonemapType = ri.Cvar_Get("qray_tonemapType", "4", CVAR_ARCHIVE);
@@ -537,6 +779,10 @@ void RegisterCvars()
     ri.Cvar_SetDescription(qrayLightTopUp,
         "Distance in Quake units within which clusters receive lights their PVS row does not list.");
 
+    qrayDlightScale = ri.Cvar_Get("qray_dlightScale", "200", CVAR_ARCHIVE);
+    ri.Cvar_SetDescription(qrayDlightScale,
+        "Intensity scale applied to per-frame Quake 3 dynamic lights.");
+
     qrayViewMode = ri.Cvar_Get("qray_viewMode", "7", CVAR_ARCHIVE);
     ri.Cvar_SetDescription(qrayViewMode, "Debug camera matrix layout selection for QuakeRay.");
 
@@ -576,6 +822,111 @@ void RegisterCvars()
     qrayAlphaTest = ri.Cvar_Get("qray_alphaTest", "1", CVAR_TEMP);
     ri.Cvar_SetDescription(qrayAlphaTest,
         "Debug: 1 = honour alphaFunc stages through the alpha tested hit group, 0 = opaque.");
+
+    qrayGiLevel = ri.Cvar_Get("qray_giLevel", "1", CVAR_ARCHIVE);
+    ri.Cvar_SetDescription(qrayGiLevel,
+        "Indirect lighting level: 0 disables GI, 1 uses one bounce, 2 enables the second bounce.");
+
+    qrayDenoiser = ri.Cvar_Get("qray_denoiser", "1", CVAR_ARCHIVE);
+    ri.Cvar_SetDescription(qrayDenoiser, "Enable the QuakeRay temporal denoiser.");
+
+    qrayNeeSamples = ri.Cvar_Get("qray_neeSamples", "2", CVAR_ARCHIVE);
+    ri.Cvar_SetDescription(qrayNeeSamples, "Direct-light samples per pixel: 1 or 2.");
+
+    qrayRestir = ri.Cvar_Get("qray_restir", "1", CVAR_ARCHIVE);
+    ri.Cvar_SetDescription(qrayRestir,
+        "Use ReSTIR over the global light list instead of per-cluster light sampling.");
+
+    qrayRestirCandidates = ri.Cvar_Get("qray_restirCandidates", "8", CVAR_ARCHIVE);
+    ri.Cvar_SetDescription(qrayRestirCandidates, "ReSTIR candidates per light sample, from 1 to 64.");
+
+    qrayCellWorldSize = ri.Cvar_Get("qray_cellWorldSize", "2.0", CVAR_ARCHIVE);
+    ri.Cvar_SetDescription(qrayCellWorldSize, "ReSTIR and GI spatial cell size in metres.");
+
+    qraySunBounceRange = ri.Cvar_Get("qray_sunBounceRange", "50.8", CVAR_ARCHIVE);
+    ri.Cvar_SetDescription(qraySunBounceRange,
+        "Sun reach into an indirect bounce in metres; 0 disables indirect sunlight.");
+
+    qrayPhysicalSky = ri.Cvar_Get("qray_physicalSky", "1", CVAR_ARCHIVE);
+    ri.Cvar_SetDescription(qrayPhysicalSky,
+        "Use QuakeRay's procedural sky instead of the map's rasterized sky cubemap.");
+
+    qrayPhysicalSkySun = ri.Cvar_Get("qray_physicalSkySun", "1", CVAR_ARCHIVE);
+    ri.Cvar_SetDescription(qrayPhysicalSkySun,
+        "Upload the map sun as the physical directional light and procedural sun disc.");
+
+    qraySkyColor = ri.Cvar_Get("qray_skyColor", "auto", CVAR_ARCHIVE);
+    ri.Cvar_SetDescription(qraySkyColor,
+        "Procedural sky colour as R G B in the 0..255 range; auto derives the tint from "
+        "the map sky and uses QuakeRay's blue profile for black space skies.");
+
+    qraySunDiscSize = ri.Cvar_Get("qray_sunDiscSize", "1.0", CVAR_ARCHIVE);
+    ri.Cvar_SetDescription(qraySunDiscSize, "Scale of the visible procedural sun disc.");
+
+    qrayClouds = ri.Cvar_Get("qray_clouds", "1", CVAR_ARCHIVE);
+    ri.Cvar_SetDescription(qrayClouds, "Enable QuakeRay's volumetric cloud layer.");
+
+    qrayCloudColor = ri.Cvar_Get("qray_cloudColor", "255 255 255", CVAR_ARCHIVE);
+    ri.Cvar_SetDescription(qrayCloudColor,
+        "Cloud colour as R G B in the 0..255 range; legacy 0..1 values are accepted.");
+
+    qrayCloudCoverage = ri.Cvar_Get("qray_cloudCoverage", "0.2", CVAR_ARCHIVE);
+    ri.Cvar_SetDescription(qrayCloudCoverage, "Volumetric cloud coverage in the range 0..1.");
+
+    qrayCloudDensity = ri.Cvar_Get("qray_cloudDensity", "0.8", CVAR_ARCHIVE);
+    ri.Cvar_SetDescription(qrayCloudDensity, "Volumetric cloud density.");
+
+    qrayCloudSpeed = ri.Cvar_Get("qray_cloudSpeed", "0.3", CVAR_ARCHIVE);
+    ri.Cvar_SetDescription(qrayCloudSpeed, "Volumetric cloud motion rate.");
+
+    qrayCloudHeight = ri.Cvar_Get("qray_cloudHeight", "3500", CVAR_ARCHIVE);
+    ri.Cvar_SetDescription(qrayCloudHeight, "Cloud layer base altitude in metres.");
+
+    qrayCloudThickness = ri.Cvar_Get("qray_cloudThickness", "2250", CVAR_ARCHIVE);
+    ri.Cvar_SetDescription(qrayCloudThickness, "Cloud layer thickness in metres.");
+
+    qrayCloudOpacity = ri.Cvar_Get("qray_cloudOpacity", "1.0", CVAR_ARCHIVE);
+    ri.Cvar_SetDescription(qrayCloudOpacity, "Cloud compositing opacity in the range 0..1.");
+
+    qrayCloudQuality = ri.Cvar_Get("qray_cloudQuality", "2", CVAR_ARCHIVE);
+    ri.Cvar_SetDescription(qrayCloudQuality, "Cloud quality: 0 low through 3 ultra.");
+
+    qrayGodRays = ri.Cvar_Get("qray_godRays", "1", CVAR_ARCHIVE);
+    ri.Cvar_SetDescription(qrayGodRays, "Enable procedural sun shafts.");
+
+    qrayGodRaysIntensity = ri.Cvar_Get("qray_godRaysIntensity", "1.0", CVAR_ARCHIVE);
+    ri.Cvar_SetDescription(qrayGodRaysIntensity, "Procedural sun-shaft intensity.");
+
+    qrayGodRaysQuality = ri.Cvar_Get("qray_godRaysQuality", "2", CVAR_ARCHIVE);
+    ri.Cvar_SetDescription(qrayGodRaysQuality, "Procedural sun-shaft quality.");
+
+    qrayUncapped = ri.Cvar_Get("qray_uncapped", "0", CVAR_TEMP);
+    ri.Cvar_SetDescription(qrayUncapped,
+        "Benchmark only: use IMMEDIATE present and zero present wait instead of FIFO with latency 1.");
+
+    qrayPhysicalSkySunPitch = ri.Cvar_Get("qray_physicalSkySunPitch", "-1000", CVAR_ARCHIVE);
+    ri.Cvar_SetDescription(qrayPhysicalSkySunPitch,
+        "Physical sun elevation in degrees; -1000 uses the map q3map_sun.");
+
+    qrayPhysicalSkyYaw = ri.Cvar_Get("qray_physicalSkyYaw", "-1000", CVAR_ARCHIVE);
+    ri.Cvar_SetDescription(qrayPhysicalSkyYaw,
+        "Physical sun yaw in degrees; -1000 uses the map q3map_sun.");
+
+    qrayPhysicalSkyPower = ri.Cvar_Get("qray_physicalSkyPower", "3", CVAR_ARCHIVE);
+    ri.Cvar_SetDescription(qrayPhysicalSkyPower,
+        "Physical sun power from 0 to 100; 0 keeps the sun disabled.");
+
+    qraySkyAmbientLod = ri.Cvar_Get("qray_skyAmbientLod", "4", CVAR_ARCHIVE);
+    ri.Cvar_SetDescription(qraySkyAmbientLod,
+        "Cubemap/procedural-sky mip level used for ambient lighting.");
+
+    qraySkyLightMultiplier = ri.Cvar_Get("qray_skyLightMultiplier", "1.0", CVAR_ARCHIVE);
+    ri.Cvar_SetDescription(qraySkyLightMultiplier,
+        "Multiplier on the light physical sky contributes to the scene, from 0 to 8.");
+
+    qrayIndirectHalfRes = ri.Cvar_Get("qray_indirectHalfRes", "1", CVAR_ARCHIVE);
+    ri.Cvar_SetDescription(qrayIndirectHalfRes,
+        "Trace indirect lighting at half resolution while keeping the primary visibility pass full resolution.");
 }
 
 bool CreateDefaultMaterial()
@@ -652,7 +1003,19 @@ bool LoadQ3Texture(const char *shaderName, int &width, int &height, std::vector<
             for (char &character : key) {
                 character = static_cast<char>(std::tolower(static_cast<unsigned char>(character)));
             }
-            textureHasAlpha[key] = channels == 4 || channels == 2;
+            bool hasTransparentPixel = false;
+            if (channels == 4 || channels == 2) {
+                for (size_t index = 3; index < pixels.size(); index += 4) {
+                    if (pixels[index] < 250) {
+                        hasTransparentPixel = true;
+                        break;
+                    }
+                }
+            }
+            // Several retail effect TGAs are 32-bit even though every texel is opaque. Treating
+            // the mere presence of an alpha channel as a transparency mask leaves their black
+            // background as a solid card instead of selecting the original additive blend.
+            textureHasAlpha[key] = hasTransparentPixel;
             return true;
         }
         if (decoded != nullptr) {
@@ -810,6 +1173,99 @@ bool BlendFactorsAreDarkenDecal(const std::string &source, const std::string &de
         _stricmp(destination.c_str(), "GL_ONE_MINUS_SRC_COLOR") == 0;
 }
 
+bool IsShaderStageKeyword(const std::string &token)
+{
+    static const char *keywords[] = {
+        "map",
+        "clampmap",
+        "animmap",
+        "blendfunc",
+        "alphafunc",
+        "alphagen",
+        "rgbgen",
+        "tcmod",
+        "tcgen",
+        "depthwrite",
+        "depthfunc",
+        "detail",
+        "deformvertexes",
+        "sort",
+        "nopicmip",
+        "nomipmaps"
+    };
+    for (const char *keyword : keywords) {
+        if (_stricmp(token.c_str(), keyword) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+ShaderWaveType ParseShaderWave(const std::string &name)
+{
+    if (_stricmp(name.c_str(), "sin") == 0) {
+        return SHADER_WAVE_SIN;
+    }
+    if (_stricmp(name.c_str(), "square") == 0) {
+        return SHADER_WAVE_SQUARE;
+    }
+    if (_stricmp(name.c_str(), "triangle") == 0) {
+        return SHADER_WAVE_TRIANGLE;
+    }
+    if (_stricmp(name.c_str(), "sawtooth") == 0) {
+        return SHADER_WAVE_SAWTOOTH;
+    }
+    if (_stricmp(name.c_str(), "inversesawtooth") == 0) {
+        return SHADER_WAVE_INVERSE_SAWTOOTH;
+    }
+    if (_stricmp(name.c_str(), "noise") == 0) {
+        return SHADER_WAVE_NOISE;
+    }
+    return SHADER_WAVE_NONE;
+}
+
+float EvaluateShaderWave(ShaderWaveType type, float base, float amplitude, float phase,
+    float frequency, float timeSeconds)
+{
+    if (type == SHADER_WAVE_NONE) {
+        return 1.0f;
+    }
+
+    const float argument = timeSeconds * frequency + phase;
+    float value = 0.0f;
+    switch (type) {
+    case SHADER_WAVE_SIN:
+        value = std::sin(argument * 2.0f * kPi);
+        break;
+    case SHADER_WAVE_SQUARE:
+        value = std::sin(argument * 2.0f * kPi) >= 0.0f ? 1.0f : -1.0f;
+        break;
+    case SHADER_WAVE_TRIANGLE: {
+        const float cycle = argument - std::floor(argument);
+        value = cycle < 0.5f ? cycle * 4.0f - 1.0f : 3.0f - cycle * 4.0f;
+        break;
+    }
+    case SHADER_WAVE_SAWTOOTH:
+        value = (argument - std::floor(argument)) * 2.0f - 1.0f;
+        break;
+    case SHADER_WAVE_INVERSE_SAWTOOTH:
+        value = 1.0f - (argument - std::floor(argument)) * 2.0f;
+        break;
+    case SHADER_WAVE_NOISE: {
+        const uint32_t bits = static_cast<uint32_t>(argument * 4096.0f);
+        uint32_t hash = bits * 747796405u + 2891336453u;
+        hash = ((hash >> ((hash >> 28u) + 4u)) ^ hash) * 277803737u;
+        hash = (hash >> 22u) ^ hash;
+        value = static_cast<float>(hash & 0x00FFFFFFu) / 16777215.0f;
+        break;
+    }
+    case SHADER_WAVE_NONE:
+    default:
+        return 1.0f;
+    }
+    return std::clamp(base + amplitude * value, 0.0f, 8.0f);
+}
+
 void ConvertToDarkenDecalTexture(std::vector<uint8_t> &pixels)
 {
     for (size_t index = 0; index + 3 < pixels.size(); index += 4) {
@@ -925,6 +1381,11 @@ void LoadShaderScripts()
         bool stageAlphaTested = false;
         bool preferredAlphaTested = false;
         bool preferredEnvironment = false;
+        bool preferredStageChosen = false;
+        size_t preferredStageIndex = static_cast<size_t>(-1);
+        bool currentTransparentSurface = false;
+        std::vector<ShaderStage> currentStages;
+        ShaderStage currentStage;
         SkyShaderInfo currentSky;
         bool currentSkyParsed = false;
         bool currentSkyFlag = false;
@@ -943,6 +1404,10 @@ void LoadShaderScripts()
                     preferredDarkenDecal = false;
                     preferredAlphaTested = false;
                     preferredEnvironment = false;
+                    preferredStageChosen = false;
+                    preferredStageIndex = static_cast<size_t>(-1);
+                    currentTransparentSurface = false;
+                    currentStages.clear();
                     currentSky = SkyShaderInfo{};
                     currentSkyParsed = false;
                     currentSkyFlag = false;
@@ -956,6 +1421,7 @@ void LoadShaderScripts()
                         stageBlendDst = QR_BLEND_FACTOR_ZERO;
                         stageDarkenDecal = false;
                         stageAlphaTested = false;
+                        currentStage = ShaderStage{};
                         stageScale[0] = 1.0f;
                         stageScale[1] = 1.0f;
                     }
@@ -966,31 +1432,57 @@ void LoadShaderScripts()
             if (token == "}") {
                 if (depth == 2) {
                     if (!stageMap.empty()) {
-                        if (!stageHasEnvironment) {
+                        currentStage.map = stageMap;
+                        currentStage.blend = stageBlend;
+                        currentStage.blendSrc = stageBlendSrc;
+                        currentStage.blendDst = stageBlendDst;
+                        currentStage.blended = stageBlend != QR_GEOMETRY_MATERIAL_BLEND_TYPE_OPAQUE ||
+                            stageBlendSrc != QR_BLEND_FACTOR_ONE ||
+                            stageBlendDst != QR_BLEND_FACTOR_ZERO;
+                        currentStage.darkenDecal = stageDarkenDecal;
+                        currentStage.alphaTested = stageAlphaTested;
+                        currentStage.environmentMap = stageHasEnvironment;
+                        currentStage.lightmap = _stricmp(stageMap.c_str(), "$lightmap") == 0;
+                        currentStage.dynamic = currentStage.dynamic ||
+                            currentStage.blended || currentStage.animationMaps.size() > 1u;
+                        currentStages.push_back(currentStage);
+                        const size_t currentStageIndex = currentStages.size() - 1u;
+
+                        const bool betterBaseStage = !preferredStageChosen ||
+                            preferredEnvironment ||
+                            (stageBlend == QR_GEOMETRY_MATERIAL_BLEND_TYPE_OPAQUE &&
+                             preferredBlend != QR_GEOMETRY_MATERIAL_BLEND_TYPE_OPAQUE);
+                        if (!stageHasEnvironment && !currentStage.lightmap && betterBaseStage) {
                             preferredMap = stageMap;
                             preferredBlend = stageBlend;
                             preferredBlendSrc = stageBlendSrc;
                             preferredBlendDst = stageBlendDst;
                             preferredDarkenDecal = stageDarkenDecal;
                             preferredEnvironment = false;
+                            preferredStageChosen = true;
+                            preferredStageIndex = currentStageIndex;
                             // alphaFunc is usually on the base stage while the lightmap stage
                             // that follows clears the flag again, so it has to stick.
                             preferredAlphaTested = preferredAlphaTested || stageAlphaTested;
-                        } else if (preferredMap.empty()) {
+                        } else if (stageHasEnvironment && !preferredStageChosen) {
                             preferredMap = stageMap;
                             preferredBlend = stageBlend;
                             preferredBlendSrc = stageBlendSrc;
                             preferredBlendDst = stageBlendDst;
                             preferredDarkenDecal = stageDarkenDecal;
                             preferredEnvironment = true;
+                            preferredStageChosen = true;
+                            preferredStageIndex = currentStageIndex;
                             preferredAlphaTested = preferredAlphaTested || stageAlphaTested;
                         }
-                        SkyStage stage;
-                        stage.map = stageMap;
-                        stage.scale[0] = stageScale[0];
-                        stage.scale[1] = stageScale[1];
-                        stage.additive = stageBlend == QR_GEOMETRY_MATERIAL_BLEND_TYPE_ADD;
-                        currentSky.stages.push_back(stage);
+                        if (!currentStage.lightmap) {
+                            SkyStage stage;
+                            stage.map = stageMap;
+                            stage.scale[0] = stageScale[0];
+                            stage.scale[1] = stageScale[1];
+                            stage.additive = stageBlend == QR_GEOMETRY_MATERIAL_BLEND_TYPE_ADD;
+                            currentSky.stages.push_back(stage);
+                        }
                     }
                     stageMap.clear();
                     stageHasEnvironment = false;
@@ -999,14 +1491,42 @@ void LoadShaderScripts()
                     stageBlendDst = QR_BLEND_FACTOR_ZERO;
                     stageDarkenDecal = false;
                     stageAlphaTested = false;
+                    currentStage = ShaderStage{};
                     stageScale[0] = 1.0f;
                     stageScale[1] = 1.0f;
                     depth = 1;
                 } else if (depth == 1) {
-                    if (!currentName.empty() && !preferredMap.empty()) {
-                        shaderDefinitions[NormalizeShaderName(currentName)] =
-                            {preferredMap, preferredBlend, preferredBlendSrc, preferredBlendDst,
-                                preferredDarkenDecal, preferredAlphaTested, preferredEnvironment};
+                    if (!currentName.empty() && !currentStages.empty()) {
+                        ShaderDefinition definition;
+                        definition.map = preferredMap;
+                        definition.blend = preferredBlend;
+                        definition.blendSrc = preferredBlendSrc;
+                        definition.blendDst = preferredBlendDst;
+                        definition.darkenDecal = preferredDarkenDecal;
+                        definition.alphaTested = preferredAlphaTested;
+                        definition.environmentMap = preferredEnvironment;
+                        definition.transparentSurface = currentTransparentSurface;
+                        definition.baseStageIndex = preferredStageIndex;
+                        const bool baseStageAnimated = preferredStageIndex < currentStages.size() &&
+                            currentStages[preferredStageIndex].animated;
+                        definition.tracedBase = preferredStageIndex < currentStages.size() &&
+                            !currentTransparentSurface && !baseStageAnimated &&
+                            (preferredBlend == QR_GEOMETRY_MATERIAL_BLEND_TYPE_OPAQUE ||
+                             preferredAlphaTested);
+                        definition.stages = currentStages;
+                        for (size_t stageIndex = 0; stageIndex < currentStages.size(); ++stageIndex) {
+                            const ShaderStage &stage = currentStages[stageIndex];
+                            const bool baseStage = definition.tracedBase &&
+                                stageIndex == definition.baseStageIndex;
+                            if (!baseStage && (stage.blended || stage.dynamic)) {
+                                definition.usesOverlay = true;
+                            }
+                            definition.dynamic = definition.dynamic || stage.dynamic;
+                        }
+                        if (!definition.tracedBase) {
+                            definition.usesOverlay = true;
+                        }
+                        shaderDefinitions[NormalizeShaderName(currentName)] = std::move(definition);
                     }
                     if (!currentName.empty() && currentSkyParsed) {
                         skyShaders[NormalizeShaderName(currentName)] = currentSky;
@@ -1015,6 +1535,7 @@ void LoadShaderScripts()
                         skyShaders[NormalizeShaderName(currentName)] = currentSky;
                     }
                     currentName.clear();
+                    currentStages.clear();
                     currentSky = SkyShaderInfo{};
                     currentSkyParsed = false;
                     depth = 0;
@@ -1053,6 +1574,8 @@ void LoadShaderScripts()
                 } else if (_stricmp(token.c_str(), "surfaceparm") == 0 && index + 1 < tokens.size()) {
                     if (_stricmp(tokens[index + 1].c_str(), "sky") == 0) {
                         currentSkyFlag = true;
+                    } else if (_stricmp(tokens[index + 1].c_str(), "trans") == 0) {
+                        currentTransparentSurface = true;
                     }
                     index += 1;
                 }
@@ -1062,6 +1585,7 @@ void LoadShaderScripts()
                 if (token == "tcGen" && index + 1 < tokens.size() &&
                     _stricmp(tokens[index + 1].c_str(), "environment") == 0) {
                     stageHasEnvironment = true;
+                    currentStage.environmentMap = true;
                 } else if (_stricmp(token.c_str(), "blendFunc") == 0 && index + 1 < tokens.size()) {
                     const std::string &first = tokens[index + 1];
                     // blendFunc either takes a factor pair (GL_ONE GL_ONE) or a single
@@ -1072,29 +1596,69 @@ void LoadShaderScripts()
                         stageBlendSrc = BlendFactorForName(first, QR_BLEND_FACTOR_ONE);
                         stageBlendDst = BlendFactorForName(tokens[index + 2], QR_BLEND_FACTOR_ZERO);
                         stageDarkenDecal = BlendFactorsAreDarkenDecal(first, tokens[index + 2]);
+                        currentStage.blend = stageBlend;
+                        currentStage.blendSrc = stageBlendSrc;
+                        currentStage.blendDst = stageBlendDst;
+                        currentStage.blended = stageBlend != QR_GEOMETRY_MATERIAL_BLEND_TYPE_OPAQUE ||
+                            stageBlendSrc != QR_BLEND_FACTOR_ONE ||
+                            stageBlendDst != QR_BLEND_FACTOR_ZERO;
+                        currentStage.darkenDecal = stageDarkenDecal;
                         index += 2;
                     } else {
                         stageBlend = BlendTypeForMnemonic(first);
                         stageBlendSrc = BlendFactorForMnemonic(first, true);
                         stageBlendDst = BlendFactorForMnemonic(first, false);
+                        currentStage.blend = stageBlend;
+                        currentStage.blendSrc = stageBlendSrc;
+                        currentStage.blendDst = stageBlendDst;
+                        currentStage.blended = stageBlend != QR_GEOMETRY_MATERIAL_BLEND_TYPE_OPAQUE ||
+                            stageBlendSrc != QR_BLEND_FACTOR_ONE ||
+                            stageBlendDst != QR_BLEND_FACTOR_ZERO;
                         ++index;
                     }
                 } else if (_stricmp(token.c_str(), "alphaFunc") == 0 && index + 1 < tokens.size()) {
                     // Q3 cuts these stages out of the rasterized surface (grates, foliage,
                     // chains). QuakeRay has a dedicated alpha tested hit group for that.
                     stageAlphaTested = true;
-                    index += std::min<size_t>(2, tokens.size() - index - 1);
+                    currentStage.alphaTested = true;
+                    // alphaFunc uses one comparison token (GT0, GE128, ...). Consuming two
+                    // swallowed the stage's closing brace and desynchronised every following
+                    // shader definition in the file.
+                    ++index;
                 } else if (_stricmp(token.c_str(), "map") == 0 || _stricmp(token.c_str(), "clampmap") == 0) {
                     if (index + 1 < tokens.size()) {
                         stageMap = tokens[index + 1];
+                        currentStage.map = stageMap;
+                        currentStage.lightmap = _stricmp(stageMap.c_str(), "$lightmap") == 0;
+                        ++index;
                     }
                 } else if (_stricmp(token.c_str(), "animMap") == 0 && index + 2 < tokens.size()) {
-                    stageMap = tokens[index + 2];
+                    currentStage.animationFps = std::max(
+                        static_cast<float>(std::atof(tokens[index + 1].c_str())), 0.001f);
+                    currentStage.animationMaps.clear();
+                    size_t frameIndex = index + 2;
+                    while (frameIndex < tokens.size() && tokens[frameIndex] != "}" &&
+                        !IsShaderStageKeyword(tokens[frameIndex])) {
+                        currentStage.animationMaps.push_back(tokens[frameIndex]);
+                        ++frameIndex;
+                    }
+                    if (!currentStage.animationMaps.empty()) {
+                        stageMap = currentStage.animationMaps.front();
+                        currentStage.map = stageMap;
+                        currentStage.lightmap = _stricmp(stageMap.c_str(), "$lightmap") == 0;
+                    }
+                    currentStage.dynamic = currentStage.dynamic ||
+                        currentStage.animationMaps.size() > 1u;
+                    currentStage.animated = currentStage.animated ||
+                        currentStage.animationMaps.size() > 1u;
+                    index = frameIndex - 1u;
                 } else if (_stricmp(token.c_str(), "tcMod") == 0 && index + 1 < tokens.size()) {
                     // tcMod sub-commands take a variable number of arguments, so only the
                     // ones that matter here are consumed; eating a fixed count would
                     // swallow the closing brace of the stage.
                     const char *subCommand = tokens[index + 1].c_str();
+                    currentStage.dynamic = true;
+                    currentStage.animated = true;
                     if (_stricmp(subCommand, "scale") == 0 && index + 3 < tokens.size()) {
                         stageScale[0] = static_cast<float>(std::atof(tokens[index + 2].c_str()));
                         stageScale[1] = static_cast<float>(std::atof(tokens[index + 3].c_str()));
@@ -1106,12 +1670,43 @@ void LoadShaderScripts()
                         }
                         index += 3;
                     } else if (_stricmp(subCommand, "scroll") == 0 && index + 3 < tokens.size()) {
+                        currentStage.scroll[0] +=
+                            static_cast<float>(std::atof(tokens[index + 2].c_str()));
+                        currentStage.scroll[1] +=
+                            static_cast<float>(std::atof(tokens[index + 3].c_str()));
                         index += 3;
                     } else if (_stricmp(subCommand, "rotate") == 0 && index + 2 < tokens.size()) {
                         index += 2;
                     } else if (_stricmp(subCommand, "entityTranslate") == 0) {
                         index += 1;
                     }
+                } else if ((_stricmp(token.c_str(), "rgbGen") == 0 ||
+                    _stricmp(token.c_str(), "alphaGen") == 0) &&
+                    index + 1 < tokens.size() &&
+                    _stricmp(tokens[index + 1].c_str(), "wave") == 0 &&
+                    index + 6 < tokens.size()) {
+                    const ShaderWaveType wave = ParseShaderWave(tokens[index + 2]);
+                    if (wave != SHADER_WAVE_NONE) {
+                        const bool alpha = _stricmp(token.c_str(), "alphaGen") == 0;
+                        ShaderWaveType &destination = alpha ? currentStage.alphaWave
+                                                           : currentStage.rgbWave;
+                        float &base = alpha ? currentStage.alphaWaveBase
+                                            : currentStage.rgbWaveBase;
+                        float &amplitude = alpha ? currentStage.alphaWaveAmplitude
+                                                 : currentStage.rgbWaveAmplitude;
+                        float &phase = alpha ? currentStage.alphaWavePhase
+                                             : currentStage.rgbWavePhase;
+                        float &frequency = alpha ? currentStage.alphaWaveFrequency
+                                                 : currentStage.rgbWaveFrequency;
+                        destination = wave;
+                        base = static_cast<float>(std::atof(tokens[index + 3].c_str()));
+                        amplitude = static_cast<float>(std::atof(tokens[index + 4].c_str()));
+                        phase = static_cast<float>(std::atof(tokens[index + 5].c_str()));
+                        frequency = static_cast<float>(std::atof(tokens[index + 6].c_str()));
+                        currentStage.dynamic = true;
+                        currentStage.animated = true;
+                    }
+                    index += 6;
                 }
             }
         }
@@ -1136,6 +1731,19 @@ void LoadShaderScripts()
         }
         HostLog("LoadShaderScripts: definitions=%zu alphaTested=%zu [%s]",
             shaderDefinitions.size(), alphaTestedCount, alphaTestedNames.c_str());
+        static const char *reportedShaders[] = {
+            "textures/sfx/launchpad_diamond",
+            "textures/sfx/diamond2cjumppad",
+            "models/mapobjects/spotlamp/beam",
+        };
+        for (const char *reportedShader : reportedShaders) {
+            const auto definitionIt = shaderDefinitions.find(NormalizeShaderName(reportedShader));
+            HostLog("LoadShaderScripts: probe shader='%s' found=%d map='%s' stages=%zu overlay=%d",
+                reportedShader, definitionIt != shaderDefinitions.end() ? 1 : 0,
+                definitionIt != shaderDefinitions.end() ? definitionIt->second.map.c_str() : "",
+                definitionIt != shaderDefinitions.end() ? definitionIt->second.stages.size() : 0u,
+                definitionIt != shaderDefinitions.end() && definitionIt->second.usesOverlay ? 1 : 0);
+        }
     }
 
 }
@@ -1453,19 +2061,9 @@ QrMaterial CreateMaterialForShader(int shaderNum, const char *shaderName)
     }
     shaderMaterialAttempted[static_cast<size_t>(shaderNum)] = 1;
 
-    int width = 0;
-    int height = 0;
-    std::vector<uint8_t> albedo;
-    if (!LoadQ3Texture(shaderName, width, height, albedo)) {
-        return defaultMaterial;
-    }
-
-    QrMaterial material = CreateMaterialFromPixels(shaderName, width, height, albedo,
-        QR_SAMPLER_ADDRESS_MODE_REPEAT);
-    if (material == QR_NO_MATERIAL) {
-        return defaultMaterial;
-    }
-
+    // BSP shader names frequently have no image of their own. Resolve the script's base
+    // stage first instead of dropping every such surface to the white fallback material.
+    const QrMaterial material = GetMaterialForTextureName(shaderName);
     shaderMaterials[static_cast<size_t>(shaderNum)] = material;
     return material;
 }
@@ -1503,6 +2101,9 @@ void ResetMaterialState()
     defaultMaterial = QR_NO_MATERIAL;
     markTriangles.clear();
     markGrid.clear();
+    worldSurfaceInfos.clear();
+    worldShaderNames.clear();
+    worldOverlayBatches.clear();
     skyCubemap = QR_EMPTY_CUBEMAP;
 }
 
@@ -1597,12 +2198,37 @@ bool CreateQrayInstance()
     return true;
 }
 
+bool ConfigureSpatialConvention()
+{
+    QrSpatialConvention spatial{};
+    spatial.size = sizeof(spatial);
+    spatial.version = QR_SPATIAL_CONVENTION_VERSION;
+    spatial.sceneXAxis = QR_AXIS_POSITIVE_X;
+    spatial.sceneYAxis = QR_AXIS_POSITIVE_Y;
+    spatial.sceneZAxis = QR_AXIS_POSITIVE_Z;
+    spatial.hostIsRightHanded = QR_TRUE;
+
+    const QrResult result = qrSetSpatialConvention(qrayInstance, &spatial);
+    HostLog("ConfigureSpatialConvention: identity Z-up right-handed result=%d scale=%f",
+        static_cast<int>(result), kQuakeUnitToMeter);
+    if (result != QR_SUCCESS) {
+        ri.Printf(PRINT_WARNING, "rendererqray: qrSetSpatialConvention failed: %d\n",
+            static_cast<int>(result));
+        return false;
+    }
+    return true;
+}
+
 // Retail Q3 bakes the sun into the lightmaps, so the sidecar has to place it from the sky
 // shader. Maps without q3map_sun fall back to the default that matches the retail lighting
 // direction of an unmodified Quake 3.
 constexpr float kQ3MapSunDefaultDegrees = 232.0f;
 constexpr float kQ3MapSunDefaultElevation = 55.0f;
 constexpr float kQ3MapSunReferenceIntensity = 80.0f;
+// QuakeRay's host scales the physical sky radiance by 0.1 before it reaches the SDK.
+// Passing a 0..1 sky texture straight through made the Q3 sidecar ten times brighter.
+constexpr float kQuakeRaySkyRadianceScale = 0.1f;
+constexpr float kQuakeRaySkyLightMultiplierMax = 8.0f;
 
 // The map's q3map_sun is the source of truth for the sun, qray_sunColor and qray_sunIntensity
 // are the manual overrides. Shared by the directional light and by the disc that gets burned
@@ -1636,25 +2262,40 @@ bool ResolveSun(float lightDirection[3], float color[3], float &intensity)
     }
     if (qraySunColor != nullptr && qraySunColor->string[0] != '\0') {
         scale = 1.0f;
-        if (std::sscanf(qraySunColor->string, "%f %f %f", &r, &g, &b) != 3) {
+        float parsed[3] = {};
+        if (std::sscanf(qraySunColor->string, "%f %f %f", &parsed[0], &parsed[1], &parsed[2]) != 3) {
             r = 1.0f;
             g = 0.95f;
             b = 0.85f;
+        } else {
+            const bool usesByteRange = parsed[0] > 1.0f || parsed[1] > 1.0f || parsed[2] > 1.0f;
+            const float colorScale = usesByteRange ? 1.0f / 255.0f : 1.0f;
+            r = std::clamp(parsed[0] * colorScale, 0.0f, 1.0f);
+            g = std::clamp(parsed[1] * colorScale, 0.0f, 1.0f);
+            b = std::clamp(parsed[2] * colorScale, 0.0f, 1.0f);
         }
     }
 
     color[0] = r;
     color[1] = g;
     color[2] = b;
-    intensity = CvarFloat(qraySunIntensity, 3.0f) * scale;
+    intensity = std::clamp(CvarFloat(qrayPhysicalSkyPower, 3.0f), 0.0f, 100.0f) * scale;
 
     lightDirection[0] = 0.35f;
     lightDirection[1] = 0.45f;
     lightDirection[2] = -0.82f;
-    if (hasSun) {
+    const float directionOverride = -999.0f;
+    const float pitchOverride = CvarFloat(qrayPhysicalSkySunPitch, -1000.0f);
+    const float yawOverride = CvarFloat(qrayPhysicalSkyYaw, -1000.0f);
+    const bool hasDirectionOverride = pitchOverride > directionOverride ||
+        yawOverride > directionOverride;
+    if (hasSun || hasDirectionOverride) {
         const float toRadians = 3.14159265358979f / 180.0f;
-        const float yaw = degrees * toRadians;
-        const float pitch = elevation * toRadians;
+        const float sunYaw = yawOverride > directionOverride ? yawOverride : degrees;
+        const float sunPitch = std::clamp(
+            pitchOverride > directionOverride ? pitchOverride : elevation, -89.0f, 89.0f);
+        const float yaw = sunYaw * toRadians;
+        const float pitch = sunPitch * toRadians;
         // degrees/elevation describe where the sun sits in the sky, the light travels the
         // opposite way.
         lightDirection[0] = -std::cos(yaw) * std::cos(pitch);
@@ -1667,10 +2308,17 @@ bool ResolveSun(float lightDirection[3], float color[3], float &intensity)
 
 void UploadSunLight()
 {
+    if (qrayPhysicalSkySun != nullptr && qrayPhysicalSkySun->integer == 0) {
+        return;
+    }
+
     float color[3] = {1.0f, 0.95f, 0.85f};
     float sunDirection[3] = {0.35f, 0.45f, -0.82f};
     float intensity = 3.0f;
     ResolveSun(sunDirection, color, intensity);
+    if (intensity <= 0.0f) {
+        return;
+    }
 
     QrDirectionalLightUploadInfo light{};
     light.uniqueID = 1;
@@ -1680,7 +2328,7 @@ void UploadSunLight()
     light.direction.data[0] = sunDirection[0];
     light.direction.data[1] = sunDirection[1];
     light.direction.data[2] = sunDirection[2];
-    light.angularDiameterDegrees = 1.0f;
+    light.angularDiameterDegrees = 0.53f;
 
     const QrResult result = qrUploadDirectionalLight(qrayInstance, &light);
     if (result != QR_SUCCESS) {
@@ -1704,10 +2352,8 @@ void UploadMapLights()
         light.color.data[0] = source.color[0] * intensityScale;
         light.color.data[1] = source.color[1] * intensityScale;
         light.color.data[2] = source.color[2] * intensityScale;
-        light.position.data[0] = source.position[0];
-        light.position.data[1] = source.position[1];
-        light.position.data[2] = source.position[2];
-        light.radius = sphereRadius;
+        QuakePositionToMeters(source.position, light.position);
+        light.radius = QuakeUnitsToMeters(sphereRadius);
 
         const QrResult result = qrUploadSphericalLight(qrayInstance, &light);
         if (result != QR_SUCCESS) {
@@ -1717,13 +2363,69 @@ void UploadMapLights()
     }
 }
 
+void UploadDynamicLights()
+{
+    static size_t lastLightCount = 0;
+    if (dynamicLights.size() != lastLightCount) {
+        lastLightCount = dynamicLights.size();
+        size_t additive = 0;
+        size_t linear = 0;
+        for (const DynamicLight &light : dynamicLights) {
+            additive += light.additive ? 1u : 0u;
+            linear += light.linear ? 1u : 0u;
+        }
+        HostLog("UploadDynamicLights: count=%zu additive=%zu linear=%zu",
+            dynamicLights.size(), additive, linear);
+    }
+    if (qrayInstance == QR_NULL_HANDLE || dynamicLights.empty()) {
+        return;
+    }
+
+    const float intensityScale = CvarFloat(qrayDlightScale, 200.0f);
+    const float emissionRadius = QuakeUnitsToMeters(
+        std::max(1.0f, CvarFloat(qrayLightRadius, 16.0f)));
+
+    for (size_t i = 0; i < dynamicLights.size(); ++i) {
+        const DynamicLight &source = dynamicLights[i];
+        QrSphericalLightUploadInfo light{};
+        light.uniqueID = kDynamicLightUniqueIdBase + i;
+        light.color.data[0] = source.color[0] * intensityScale;
+        light.color.data[1] = source.color[1] * intensityScale;
+        light.color.data[2] = source.color[2] * intensityScale;
+        QuakePositionToMeters(source.origin, light.position);
+        light.radius = emissionRadius;
+
+        const QrResult result = qrUploadSphericalLight(qrayInstance, &light);
+        if (result != QR_SUCCESS) {
+            HostLog("UploadDynamicLights: light %zu failed result=%d", i, static_cast<int>(result));
+            break;
+        }
+    }
+}
+
 void UploadClusterLightSources();
+
+bool GlobalLightSamplingEnabled()
+{
+    return qrayRestir != nullptr && qrayRestir->integer != 0;
+}
 
 void UploadSceneLights()
 {
     UploadSunLight();
     UploadMapLights();
-    UploadClusterLightSources();
+    UploadDynamicLights();
+    const bool globalSampling = GlobalLightSamplingEnabled();
+    static int reportedSamplingMode = -1;
+    if (reportedSamplingMode != static_cast<int>(globalSampling)) {
+        reportedSamplingMode = globalSampling ? 1 : 0;
+        HostLog("Lighting: %s", globalSampling
+            ? "ReSTIR over the global light list (cluster sources disabled)"
+            : "per-cluster light sources");
+    }
+    if (!globalSampling) {
+        UploadClusterLightSources();
+    }
 }
 
 void RotationMatrixQ1(float matrix[16], float angle, float x, float y, float z)
@@ -2200,10 +2902,46 @@ bool HostPointInLeafReady()
     return !bspClusterTree.leafClusters.empty();
 }
 
+int NearbyBspClusterForPoint(const float point[3], bool *neededNudge = nullptr)
+{
+    if (neededNudge != nullptr) {
+        *neededNudge = false;
+    }
+    if (!HostPointInLeafReady()) {
+        return -1;
+    }
+
+    int cluster = bspClusterTree.ClusterForPoint(point);
+    if (cluster >= 1 && static_cast<uint32_t>(cluster) < worldClusters.clusterCount) {
+        return cluster;
+    }
+
+    // Q3 surface vertices and light entities routinely lie in a solid leaf on the boundary
+    // of the lit volume. Probe a few short axis offsets so they inherit a real adjacent leaf.
+    static const float kProbeOffsets[] = {0.25f, 1.0f, 4.0f, 16.0f, 48.0f, 128.0f};
+    for (float offset : kProbeOffsets) {
+        for (int axis = 0; axis < 3; ++axis) {
+            for (int sign = -1; sign <= 1; sign += 2) {
+                float moved[3] = {point[0], point[1], point[2]};
+                moved[axis] += offset * static_cast<float>(sign);
+                cluster = bspClusterTree.ClusterForPoint(moved);
+                if (cluster >= 1 && static_cast<uint32_t>(cluster) < worldClusters.clusterCount) {
+                    if (neededNudge != nullptr) {
+                        *neededNudge = true;
+                    }
+                    return cluster;
+                }
+            }
+        }
+    }
+
+    return -1;
+}
+
 uint32_t ClusterIndexForPoint(const float point[3])
 {
-    const int cluster = bspClusterTree.ClusterForPoint(point);
-    if (cluster < 0 || static_cast<uint32_t>(cluster) >= worldClusters.clusterCount) {
+    const int cluster = NearbyBspClusterForPoint(point);
+    if (cluster < 1 || static_cast<uint32_t>(cluster) >= worldClusters.clusterCount) {
         return 0u;
     }
     return static_cast<uint32_t>(cluster);
@@ -2251,14 +2989,16 @@ void LoadBspClusterTree(const dplane_t *planes, int planeCount, const dnode_t *n
             // Solid leaves carry no visibility row of their own.
             continue;
         }
-        bspClusterTree.leafClusters[static_cast<size_t>(leaf)] = cluster;
-        clusterCount = std::max(clusterCount, static_cast<uint32_t>(cluster) + 1u);
+        // The SDK reserves cluster 0. Q3's PVS row bit c maps to SDK cluster c + 1.
+        const uint32_t sdkCluster = static_cast<uint32_t>(cluster) + 1u;
+        bspClusterTree.leafClusters[static_cast<size_t>(leaf)] = static_cast<int>(sdkCluster);
+        clusterCount = std::max(clusterCount, sdkCluster + 1u);
     }
 
     if (clusterCount > kMaxLightClusters) {
         ri.Printf(PRINT_WARNING,
             "rendererqray: the map has %u light clusters, only the first %u get a light list\n",
-            clusterCount, kMaxLightClusters);
+            clusterCount - 1u, kMaxLightClusters - 1u);
         clusterCount = kMaxLightClusters;
     }
 
@@ -2306,31 +3046,18 @@ void ResolveMapLightClusters()
         return;
     }
 
-    static const float kProbeOffsets[] = {1.0f, 4.0f, 16.0f, 48.0f, 128.0f, 256.0f};
     int resolved = 0;
     int displaced = 0;
 
     for (size_t index = 0; index < mapLights.size(); ++index) {
         const MapLight &light = mapLights[index];
-        int cluster = bspClusterTree.ClusterForPoint(light.position);
-        if (cluster < 0) {
-            // Light entities are routinely embedded in the wall they are attached to, and that
-            // leaf is solid, so the light has to be nudged out until it reaches a real cluster.
-            for (size_t probe = 0; probe < sizeof(kProbeOffsets) / sizeof(kProbeOffsets[0]) && cluster < 0; ++probe) {
-                for (int axis = 0; axis < 3 && cluster < 0; ++axis) {
-                    for (int sign = -1; sign <= 1 && cluster < 0; sign += 2) {
-                        float moved[3] = {light.position[0], light.position[1], light.position[2]};
-                        moved[axis] += kProbeOffsets[probe] * static_cast<float>(sign);
-                        cluster = bspClusterTree.ClusterForPoint(moved);
-                    }
-                }
-            }
-            if (cluster >= 0) {
-                ++displaced;
-            }
+        bool nudged = false;
+        const int cluster = NearbyBspClusterForPoint(light.position, &nudged);
+        if (nudged) {
+            ++displaced;
         }
 
-        if (cluster < 0 || static_cast<uint32_t>(cluster) >= worldClusters.clusterCount) {
+        if (cluster < 1 || static_cast<uint32_t>(cluster) >= worldClusters.clusterCount) {
             continue;
         }
 
@@ -2370,28 +3097,31 @@ void BuildClusterPvs(const uint8_t *visibility, uint32_t visibilitySize)
     uint32_t encodedRows = 0;
     const uint32_t rowBytes = worldClusters.pvsRowBytes;
     std::vector<uint8_t> row(rowBytes);
-    for (uint32_t cluster = 0; cluster < clusterCount && static_cast<int32_t>(cluster) < visClusters; ++cluster) {
+    for (uint32_t cluster = 0; cluster + 1u < clusterCount && static_cast<int32_t>(cluster) < visClusters; ++cluster) {
+        const uint32_t sdkCluster = cluster + 1u;
         const uint8_t *source = visibility + 8 +
             static_cast<size_t>(cluster) * static_cast<size_t>(visRowBytes);
 
-        if (cluster < worldClusters.skyFlags.size() && worldClusters.skyFlags[cluster] != 0) {
+        if (sdkCluster < worldClusters.skyFlags.size() && worldClusters.skyFlags[sdkCluster] != 0) {
             ++skyClusters;
-            for (uint32_t byte = 0; byte < rowBytes && byte < static_cast<uint32_t>(visRowBytes); ++byte) {
-                worldClusters.skyVis[byte] |= source[byte];
+            for (uint32_t byte = 0; byte < rowBytes; ++byte) {
+                uint32_t bits = 0;
+                if (byte < static_cast<uint32_t>(visRowBytes)) {
+                    bits |= static_cast<uint32_t>(source[byte]) << 1;
+                }
+                if (byte > 0 && byte - 1u < static_cast<uint32_t>(visRowBytes)) {
+                    bits |= static_cast<uint32_t>(source[byte - 1u]) >> 7;
+                }
+                worldClusters.skyVis[byte] |= static_cast<uint8_t>(bits & 0xFFu);
             }
         }
 
-        // Quake 3 numbers its clusters from zero, while the SDK reads bit (cluster - 1) of a row,
-        // so every row is shifted down by one bit on the way in.
-        for (uint32_t byte = 0; byte < rowBytes; ++byte) {
-            const uint32_t low = static_cast<uint32_t>(source[byte]) >> 1;
-            const uint32_t high = (byte + 1u < static_cast<uint32_t>(visRowBytes))
-                ? static_cast<uint32_t>(source[byte + 1u]) << 7
-                : 0u;
-            row[byte] = static_cast<uint8_t>((low | high) & 0xFFu);
-        }
+        // Q3 row bit c names Q3 cluster c. The SDK stores that row at cluster c + 1 and
+        // itself maps row bit c to SDK cluster c + 1 during the PVS walk.
+        std::fill(row.begin(), row.end(), 0);
+        std::memcpy(row.data(), source, std::min(rowBytes, static_cast<uint32_t>(visRowBytes)));
 
-        worldClusters.visOffsets[cluster] = static_cast<int32_t>(worldClusters.visData.size());
+        worldClusters.visOffsets[sdkCluster] = static_cast<int32_t>(worldClusters.visData.size());
         for (uint32_t byte = 0; byte < rowBytes;) {
             if (row[byte] != 0) {
                 worldClusters.visData.push_back(row[byte]);
@@ -2409,7 +3139,7 @@ void BuildClusterPvs(const uint8_t *visibility, uint32_t visibilitySize)
         ++encodedRows;
     }
 
-    HostLog("BuildClusterPvs: %u of %u clusters, %u sky clusters, %zu encoded bytes, row %u",
+    HostLog("BuildClusterPvs: %u Q3 rows into %u SDK clusters, %u sky clusters, %zu encoded bytes, row %u",
         encodedRows, clusterCount, skyClusters, worldClusters.visData.size(), rowBytes);
 }
 
@@ -2445,8 +3175,20 @@ void UploadWorldClusters()
     QrWorldLightsUploadInfo info{};
     info.flags = QR_WORLD_LIGHTS_UPLOAD_PRINT_STATS_BIT;
     info.numClusters = worldClusters.clusterCount;
-    info.pClusterMins = worldClusters.mins.data();
-    info.pClusterMaxs = worldClusters.maxs.data();
+    static std::vector<QrFloat3D> meterClusterMins;
+    static std::vector<QrFloat3D> meterClusterMaxs;
+    meterClusterMins = worldClusters.mins;
+    meterClusterMaxs = worldClusters.maxs;
+    for (uint32_t cluster = 0; cluster < worldClusters.clusterCount; ++cluster) {
+        for (int axis = 0; axis < 3; ++axis) {
+            meterClusterMins[cluster].data[axis] =
+                QuakeUnitsToMeters(meterClusterMins[cluster].data[axis]);
+            meterClusterMaxs[cluster].data[axis] =
+                QuakeUnitsToMeters(meterClusterMaxs[cluster].data[axis]);
+        }
+    }
+    info.pClusterMins = meterClusterMins.data();
+    info.pClusterMaxs = meterClusterMaxs.data();
     info.pClusterFlags = worldClusters.flags.data();
     info.numFaces = 0;
     info.pFaces = nullptr;
@@ -2471,33 +3213,49 @@ void UploadWorldClusters()
 
 void UploadClusterLightSources()
 {
-    if (qrayInstance == QR_NULL_HANDLE || !worldClusters.uploaded || mapLights.empty()) {
+    if (qrayInstance == QR_NULL_HANDLE || !worldClusters.uploaded ||
+        (mapLights.empty() && dynamicLights.empty())) {
         return;
     }
 
     const float lightScale = CvarFloat(qrayLightScale, 200.0f);
+    const float dlightScale = CvarFloat(qrayDlightScale, 200.0f);
     const float reachScale = CvarFloat(qrayLightRadiusScale, 1.0f);
-    const float topUpReach = CvarFloat(qrayLightTopUp, 1024.0f);
+    const float topUpReach = QuakeUnitsToMeters(CvarFloat(qrayLightTopUp, 1024.0f));
 
     static std::vector<QrClusterLightSource> sources;
-    sources.resize(mapLights.size());
+    sources.resize(mapLights.size() + dynamicLights.size());
 
     for (size_t index = 0; index < mapLights.size(); ++index) {
         const MapLight &light = mapLights[index];
         QrClusterLightSource &source = sources[index];
         source = QrClusterLightSource{};
         source.uniqueID = 1000 + index;
-        source.origin.data[0] = light.position[0];
-        source.origin.data[1] = light.position[1];
-        source.origin.data[2] = light.position[2];
+        QuakePositionToMeters(light.position, source.origin);
         source.cluster = index < mapLightClusters.size()
             ? mapLightClusters[index]
             : static_cast<uint32_t>(QR_CLUSTER_LIGHT_NO_CLUSTER);
         source.reach = 0.0f;
-        source.radius = std::max(1.0f, light.radius * reachScale);
+        source.radius = QuakeUnitsToMeters(std::max(1.0f, light.radius * reachScale));
         source.clusterCount = 0;
         source.pClusters = nullptr;
         source.power = (light.color[0] + light.color[1] + light.color[2]) * lightScale / 3.0f;
+    }
+
+    for (size_t index = 0; index < dynamicLights.size(); ++index) {
+        const DynamicLight &light = dynamicLights[index];
+        QrClusterLightSource &source = sources[mapLights.size() + index];
+        source = QrClusterLightSource{};
+        source.uniqueID = kDynamicLightUniqueIdBase + index;
+        QuakePositionToMeters(light.origin, source.origin);
+        const int cluster = NearbyBspClusterForPoint(light.origin);
+        source.cluster = cluster >= 1 ? static_cast<uint32_t>(cluster)
+                                      : static_cast<uint32_t>(QR_CLUSTER_LIGHT_NO_CLUSTER);
+        source.reach = 0.0f;
+        source.radius = QuakeUnitsToMeters(std::max(1.0f, light.radius));
+        source.clusterCount = 0;
+        source.pClusters = nullptr;
+        source.power = (light.color[0] + light.color[1] + light.color[2]) * dlightScale / 3.0f;
     }
 
     QrClusterLightSourcesUploadInfo info{};
@@ -2512,6 +3270,21 @@ void UploadClusterLightSources()
     if (result != QR_SUCCESS) {
         HostLog("UploadClusterLightSources: %zu sources failed result=%d", sources.size(),
             static_cast<int>(result));
+    } else {
+        static uint32_t loggedClusterGeneration = 0;
+        static uint32_t loggedSourceCount = 0;
+        const uint32_t sourceCount = static_cast<uint32_t>(sources.size());
+        if (loggedClusterGeneration != worldClusterGeneration || loggedSourceCount != sourceCount) {
+            loggedClusterGeneration = worldClusterGeneration;
+            loggedSourceCount = sourceCount;
+            QrClusterLightStats stats{};
+            if (qrGetClusterLightStats(qrayInstance, &stats) == QR_SUCCESS) {
+                HostLog("ClusterLightStats: clusters=%u sources=%u unresolved=%u entries=%u "
+                    "grants=%u topUp=%u reachGated=%u full=%u",
+                    stats.clusters, stats.sources, stats.unresolved, stats.listEntries,
+                    stats.grants, stats.topUpGrants, stats.reachGated, stats.fullClusters);
+            }
+        }
     }
 }
 
@@ -2982,6 +3755,7 @@ void BuildMarkAcceleration(const std::vector<GeometryBatch> &batches)
     for (const GeometryBatch &batch : batches) {
         for (size_t index = 0; index + 2 < batch.indices.size(); index += 3) {
             MarkTriangle triangle;
+            triangle.sourceTriangleIndex = static_cast<uint32_t>(index / 3);
             bool valid = true;
             for (int corner = 0; corner < 3; ++corner) {
                 const uint32_t vertexIndex = batch.indices[index + static_cast<size_t>(corner)];
@@ -2992,6 +3766,13 @@ void BuildMarkAcceleration(const std::vector<GeometryBatch> &batches)
                 const QrVertex &vertex = batch.vertices[vertexIndex];
                 for (int axis = 0; axis < 3; ++axis) {
                     triangle.points[corner][axis] = vertex.position[axis];
+                    triangle.vertexNormals[corner][axis] = vertex.normal[axis];
+                }
+                for (int axis = 0; axis < 2; ++axis) {
+                    triangle.texCoords[corner][axis] = vertex.texCoord[axis];
+                }
+                if (corner == 0 && vertexIndex < batch.sourceSurfaceIndices.size()) {
+                    triangle.sourceSurfaceIndex = batch.sourceSurfaceIndices[vertexIndex];
                 }
             }
             if (!valid) {
@@ -3054,6 +3835,9 @@ bool LoadBspGeometryInner(const char *name)
     LoadShaderScripts();
     DestroySkyCubemap();
     mapSkyShaderName.clear();
+    worldSurfaceInfos.clear();
+    worldShaderNames.clear();
+    worldOverlayBatches.clear();
     for (int i = 0; i < 3; ++i) {
         worldMin[i] = 1.0e30f;
         worldMax[i] = -1.0e30f;
@@ -3119,6 +3903,11 @@ bool LoadBspGeometryInner(const char *name)
 
             shaderMaterials.assign(static_cast<size_t>(shaderCount), QR_NO_MATERIAL);
             shaderMaterialAttempted.assign(static_cast<size_t>(shaderCount), 0);
+            worldSurfaceInfos.assign(static_cast<size_t>(surfaceCount), WorldSurfaceInfo{});
+            worldShaderNames.resize(static_cast<size_t>(shaderCount));
+            for (int shaderIndex = 0; shaderIndex < shaderCount; ++shaderIndex) {
+                worldShaderNames[static_cast<size_t>(shaderIndex)] = shaders[shaderIndex].shader;
+            }
 
             int firstSurface = 0;
             int numSurfaces = surfaceCount;
@@ -3179,6 +3968,22 @@ bool LoadBspGeometryInner(const char *name)
                         continue;
                     }
 
+                    WorldSurfaceInfo &surfaceInfo = worldSurfaceInfos[static_cast<size_t>(surfaceIndex)];
+                    surfaceInfo.valid = true;
+                    surfaceInfo.shaderNum = surface.shaderNum;
+                    surfaceInfo.surfaceType = surface.surfaceType;
+                    surfaceInfo.surfaceFlags = shader.surfaceFlags;
+                    surfaceInfo.contentFlags = shader.contentFlags;
+                    surfaceInfo.firstVert = surface.firstVert;
+                    surfaceInfo.numVerts = surface.numVerts;
+                    surfaceInfo.firstIndex = surface.firstIndex;
+                    surfaceInfo.numIndexes = surface.numIndexes;
+                    surfaceInfo.lightmapNum = surface.lightmapNum;
+                    surfaceInfo.lightmapWidth = surface.lightmapWidth;
+                    surfaceInfo.lightmapHeight = surface.lightmapHeight;
+                    surfaceInfo.patchWidth = surface.patchWidth;
+                    surfaceInfo.patchHeight = surface.patchHeight;
+
                     const QrMaterial material = CreateMaterialForShader(surface.shaderNum, shader.shader);
 
                     if (surface.surfaceType == MST_PATCH) {
@@ -3233,10 +4038,44 @@ bool LoadBspGeometryInner(const char *name)
                             }
                         }
 
+                        if (patchIndices.size() >= 3) {
+                            const QrVertex &p0 = patchVerts[patchIndices[0]];
+                            const QrVertex &p1 = patchVerts[patchIndices[1]];
+                            const QrVertex &p2 = patchVerts[patchIndices[2]];
+                            const float ax = p1.position[0] - p0.position[0];
+                            const float ay = p1.position[1] - p0.position[1];
+                            const float az = p1.position[2] - p0.position[2];
+                            const float bx = p2.position[0] - p0.position[0];
+                            const float by = p2.position[1] - p0.position[1];
+                            const float bz = p2.position[2] - p0.position[2];
+                            float patchNormal[3] = {
+                                ay * bz - az * by,
+                                az * bx - ax * bz,
+                                ax * by - ay * bx,
+                            };
+                            NormalizeVector(patchNormal);
+                            for (int axis = 0; axis < 3; ++axis) {
+                                surfaceInfo.generatedNormal[axis] = patchNormal[axis];
+                                surfaceInfo.originalWindingNormal[axis] = patchNormal[axis];
+                                surfaceInfo.uploadedWindingNormal[axis] = patchNormal[axis];
+                            }
+                        }
+                        float authoredNormal[3] = {0.0f, 0.0f, 0.0f};
+                        for (int vertexIndex = 0; vertexIndex < surface.numVerts; ++vertexIndex) {
+                            const drawVert_t &source = verts[surface.firstVert + vertexIndex];
+                            for (int axis = 0; axis < 3; ++axis) {
+                                authoredNormal[axis] += source.normal[axis];
+                            }
+                        }
+                        NormalizeVector(authoredNormal);
+                        std::memcpy(surfaceInfo.authoredNormal, authoredNormal, sizeof(authoredNormal));
+
                         GeometryBatch &batch = batches[static_cast<size_t>(surface.shaderNum)];
                         batch.material = material;
                         const uint32_t baseVertex = static_cast<uint32_t>(batch.vertices.size());
                         batch.vertices.insert(batch.vertices.end(), patchVerts.begin(), patchVerts.end());
+                        batch.sourceSurfaceIndices.insert(batch.sourceSurfaceIndices.end(), patchVerts.size(),
+                            surfaceIndex);
                         batch.indices.reserve(batch.indices.size() + patchIndices.size());
                         for (uint32_t index : patchIndices) {
                             batch.indices.push_back(baseVertex + index);
@@ -3281,6 +4120,23 @@ bool LoadBspGeometryInner(const char *name)
                         faceNormal[2] = 1.0f;
                     }
 
+                    std::memcpy(surfaceInfo.generatedNormal, faceNormal, sizeof(faceNormal));
+                    if (surface.surfaceType == MST_PLANAR) {
+                        std::memcpy(surfaceInfo.planeNormal, faceNormal, sizeof(faceNormal));
+                        surfaceInfo.planeDist = faceNormal[0] * verts[surface.firstVert].xyz[0] +
+                            faceNormal[1] * verts[surface.firstVert].xyz[1] +
+                            faceNormal[2] * verts[surface.firstVert].xyz[2];
+                    }
+                    float authoredNormal[3] = {0.0f, 0.0f, 0.0f};
+                    for (int vertexIndex = 0; vertexIndex < surface.numVerts; ++vertexIndex) {
+                        const drawVert_t &source = verts[surface.firstVert + vertexIndex];
+                        for (int axis = 0; axis < 3; ++axis) {
+                            authoredNormal[axis] += source.normal[axis];
+                        }
+                    }
+                    NormalizeVector(authoredNormal);
+                    std::memcpy(surfaceInfo.authoredNormal, authoredNormal, sizeof(authoredNormal));
+
                     std::vector<QrVertex> outVerts(static_cast<size_t>(surface.numVerts));
                     for (int i = 0; i < surface.numVerts; ++i) {
                         const drawVert_t &src = verts[surface.firstVert + i];
@@ -3308,9 +4164,31 @@ bool LoadBspGeometryInner(const char *name)
                         const int index = indices[surface.firstIndex + i];
                         outIndices[static_cast<size_t>(i)] = (index >= 0 && index < surface.numVerts) ? static_cast<uint32_t>(index) : 0u;
                     }
+                    if (outIndices.size() >= 3) {
+                        const drawVert_t &p0 = verts[surface.firstVert + outIndices[0]];
+                        const drawVert_t &p1 = verts[surface.firstVert + outIndices[1]];
+                        const drawVert_t &p2 = verts[surface.firstVert + outIndices[2]];
+                        const float ax = p1.xyz[0] - p0.xyz[0];
+                        const float ay = p1.xyz[1] - p0.xyz[1];
+                        const float az = p1.xyz[2] - p0.xyz[2];
+                        const float bx = p2.xyz[0] - p0.xyz[0];
+                        const float by = p2.xyz[1] - p0.xyz[1];
+                        const float bz = p2.xyz[2] - p0.xyz[2];
+                        float originalWindingNormal[3] = {
+                            ay * bz - az * by,
+                            az * bx - ax * bz,
+                            ax * by - ay * bx,
+                        };
+                        NormalizeVector(originalWindingNormal);
+                        std::memcpy(surfaceInfo.originalWindingNormal, originalWindingNormal,
+                            sizeof(originalWindingNormal));
+                        std::memcpy(surfaceInfo.uploadedWindingNormal, originalWindingNormal,
+                            sizeof(originalWindingNormal));
+                    }
                     // Q3 treats clockwise as front facing, which is the opposite handedness of
                     // QuakeRay's ray traced shadows, so every triangle is flipped once here.
                     bool flipWinding = normalMode < 2 || normalMode >= 5;
+                    bool keptSurfaceWinding = false;
                     if (flipWinding && normalMode < 5 && surface.surfaceType == MST_PLANAR && surface.numIndexes >= 3) {
                         const int w0 = indices[surface.firstIndex + 0];
                         const int w1 = indices[surface.firstIndex + 1];
@@ -3333,6 +4211,7 @@ bool LoadBspGeometryInner(const char *name)
                             // normal; flipping those inverts their lighting, so they are left alone.
                             if (alignment > 0.0f) {
                                 flipWinding = false;
+                                keptSurfaceWinding = true;
                                 ++planarWindingKept;
                             }
                         }
@@ -3340,6 +4219,10 @@ bool LoadBspGeometryInner(const char *name)
                     if (flipWinding) {
                         for (size_t i = 0; i + 2 < outIndices.size(); i += 3) {
                             std::swap(outIndices[i + 1], outIndices[i + 2]);
+                        }
+                        for (int axis = 0; axis < 3; ++axis) {
+                            surfaceInfo.uploadedWindingNormal[axis] =
+                                -surfaceInfo.uploadedWindingNormal[axis];
                         }
                         // Planar normals come from the BSP plane and stay valid when the winding
                         // is reversed; curve and triangle-soup normals are derived from that very
@@ -3357,12 +4240,17 @@ bool LoadBspGeometryInner(const char *name)
                     batch.material = material;
                     const bool surfaceAlphaTested = qrayAlphaTest != nullptr && qrayAlphaTest->integer != 0
                         && ShaderUsesAlphaTest(shader.shader);
+                    surfaceInfo.alphaTested = surfaceAlphaTested;
+                    surfaceInfo.windingFlipped = flipWinding;
+                    surfaceInfo.planarWindingKept = keptSurfaceWinding;
                     if (surfaceAlphaTested && !batch.alphaTested) {
                         HostLog("LoadBspGeometry: alpha tested shader \"%s\"", shader.shader);
                     }
                     batch.alphaTested = surfaceAlphaTested;
                     const uint32_t baseVertex = static_cast<uint32_t>(batch.vertices.size());
                     batch.vertices.insert(batch.vertices.end(), outVerts.begin(), outVerts.end());
+                    batch.sourceSurfaceIndices.insert(batch.sourceSurfaceIndices.end(), outVerts.size(),
+                        surfaceIndex);
                     batch.indices.reserve(batch.indices.size() + outIndices.size());
                     for (uint32_t index : outIndices) {
                         batch.indices.push_back(baseVertex + index);
@@ -3374,6 +4262,7 @@ bool LoadBspGeometryInner(const char *name)
                     uploaded, planarWindingKept);
                 int uploadedBatches = 0;
                 int alphaTestedBatches = 0;
+                int overlayBatches = 0;
                 uint32_t normalFlags = QR_GEOMETRY_UPLOAD_GENERATE_NORMALS_BIT;
                 if (normalMode == 1 || normalMode == 3) {
                     normalFlags = QR_GEOMETRY_UPLOAD_GENERATE_INVERTED_NORMALS_BIT;
@@ -3386,6 +4275,27 @@ bool LoadBspGeometryInner(const char *name)
                         continue;
                     }
 
+                    const std::string &batchShaderName =
+                        worldShaderNames[static_cast<size_t>(batchIndex)];
+                    const auto shaderDefinitionIt =
+                        shaderDefinitions.find(NormalizeShaderName(batchShaderName));
+                    if (shaderDefinitionIt != shaderDefinitions.end() &&
+                        shaderDefinitionIt->second.usesOverlay) {
+                        WorldOverlayBatch overlay;
+                        overlay.shaderName = batchShaderName;
+                        overlay.vertices = batch.vertices;
+                        overlay.indices = batch.indices;
+                        worldOverlayBatches.push_back(std::move(overlay));
+                        ++overlayBatches;
+                        HostLog("LoadBspGeometry: overlay shader='%s' stages=%zu tracedBase=%d",
+                            batchShaderName.c_str(), shaderDefinitionIt->second.stages.size(),
+                            shaderDefinitionIt->second.tracedBase ? 1 : 0);
+                        if (!shaderDefinitionIt->second.tracedBase) {
+                            continue;
+                        }
+                    }
+
+                    const std::vector<QrVertex> meterVertices = QuakeVerticesToMeters(batch.vertices);
                     QrGeometryUploadInfo upload{};
                     upload.uniqueID = static_cast<uint64_t>(batchIndex) + 1;
                     upload.flags = normalFlags;
@@ -3394,8 +4304,8 @@ bool LoadBspGeometryInner(const char *name)
                         ? QR_GEOMETRY_PASS_THROUGH_TYPE_ALPHA_TESTED
                         : QR_GEOMETRY_PASS_THROUGH_TYPE_OPAQUE;
                     upload.visibilityType = QR_GEOMETRY_VISIBILITY_TYPE_WORLD_0;
-                    upload.vertexCount = static_cast<uint32_t>(batch.vertices.size());
-                    upload.pVertices = batch.vertices.data();
+                    upload.vertexCount = static_cast<uint32_t>(meterVertices.size());
+                    upload.pVertices = meterVertices.data();
                     upload.indexCount = static_cast<uint32_t>(batch.indices.size());
                     upload.pIndices = batch.indices.data();
                     upload.layerColors[0].data[0] = 1.0f;
@@ -3422,8 +4332,20 @@ bool LoadBspGeometryInner(const char *name)
                     }
                 }
                 const QrResult submitResult = qrSubmitStaticGeometries(qrayInstance);
-                HostLog("LoadBspGeometry: qrSubmitStaticGeometries result=%d alphaTestedBatches=%d",
-                    static_cast<int>(submitResult), alphaTestedBatches);
+                HostLog("LoadBspGeometry: qrSubmitStaticGeometries result=%d alphaTestedBatches=%d "
+                    "overlayBatches=%d overlayStages=%zu",
+                    static_cast<int>(submitResult), alphaTestedBatches, overlayBatches,
+                    [&]() {
+                        size_t count = 0;
+                        for (const WorldOverlayBatch &overlay : worldOverlayBatches) {
+                            const auto it = shaderDefinitions.find(
+                                NormalizeShaderName(overlay.shaderName));
+                            if (it != shaderDefinitions.end()) {
+                                count += it->second.stages.size();
+                            }
+                        }
+                        return count;
+                    }());
                 HostLog("LoadBspGeometry: bounds min=(%f %f %f) max=(%f %f %f)", worldMin[0], worldMin[1], worldMin[2], worldMax[0], worldMax[1], worldMax[2]);
                 if (submitResult != QR_SUCCESS) {
                     ri.Printf(PRINT_WARNING, "rendererqray: qrSubmitStaticGeometries failed: %d\n", static_cast<int>(submitResult));
@@ -3583,8 +4505,9 @@ void StartFrame()
     }
 
     QrStartFrameInfo info{};
-    info.presentMode = QR_PRESENT_MODE_MAILBOX;
-    info.maxFrameLatency = 1;
+    const bool uncapped = qrayUncapped != nullptr && qrayUncapped->integer != 0;
+    info.presentMode = uncapped ? QR_PRESENT_MODE_IMMEDIATE : QR_PRESENT_MODE_VSYNC;
+    info.maxFrameLatency = uncapped ? 0u : 1u;
     info.requestShaderReload = QR_FALSE;
     info.wantFullscreenExclusive = QR_FALSE;
     info.hasFocus = QR_TRUE;
@@ -3599,6 +4522,7 @@ void StartFrame()
     sceneRendered = false;
     sceneValid = false;
     frameHasWorldScene = false;
+    dynamicLights.clear();
 
     if (!worldLoaded && !pendingWorldName.empty()) {
         LoadBspGeometry(pendingWorldName.c_str());
@@ -3625,14 +4549,15 @@ void UploadDynamicGeometry(const std::vector<QrVertex> &vertices, const std::vec
         material = defaultMaterial;
     }
 
+    const std::vector<QrVertex> meterVertices = QuakeVerticesToMeters(vertices);
     QrGeometryUploadInfo upload{};
     upload.uniqueID = NextDynamicGeometryId();
     upload.flags = QR_GEOMETRY_UPLOAD_EXACT_NORMALS_BIT | extraFlags;
     upload.geomType = QR_GEOMETRY_TYPE_DYNAMIC;
     upload.passThroughType = passThrough;
     upload.visibilityType = visibility;
-    upload.vertexCount = static_cast<uint32_t>(vertices.size());
-    upload.pVertices = vertices.data();
+    upload.vertexCount = static_cast<uint32_t>(meterVertices.size());
+    upload.pVertices = meterVertices.data();
     upload.indexCount = static_cast<uint32_t>(indices.size());
     upload.pIndices = indices.data();
     upload.layerColors[0].data[0] = 1.0f;
@@ -3662,7 +4587,8 @@ void UploadDynamicGeometry(const std::vector<QrVertex> &vertices, const std::vec
 // out the way the original renderer draws them.
 void UploadRasterizedWorldGeometry(const std::vector<QrVertex> &vertices,
     const std::vector<uint32_t> &indices, QrMaterial material, QrBlendFactor blendSource,
-    QrBlendFactor blendDestination, uint32_t pipelineStateOverride = 0xFFFFFFFFu)
+    QrBlendFactor blendDestination, uint32_t pipelineStateOverride = 0xFFFFFFFFu,
+    const float texCoordOffset[2] = nullptr, const float color[4] = nullptr)
 {
     if (qrayInstance == QR_NULL_HANDLE || vertices.empty() || !frameStarted) {
         return;
@@ -3671,19 +4597,22 @@ void UploadRasterizedWorldGeometry(const std::vector<QrVertex> &vertices,
         material = defaultMaterial;
     }
 
+    const std::vector<QrVertex> meterVertices = QuakeVerticesToMeters(vertices);
     QrRasterizedGeometryUploadInfo info{};
     info.renderType = QR_RASTERIZED_GEOMETRY_RENDER_TYPE_DEFAULT;
-    info.vertexCount = static_cast<uint32_t>(vertices.size());
-    info.pVertices = vertices.data();
+    info.vertexCount = static_cast<uint32_t>(meterVertices.size());
+    info.pVertices = meterVertices.data();
     info.indexCount = static_cast<uint32_t>(indices.size());
     info.pIndices = indices.empty() ? nullptr : indices.data();
     info.transform = IdentityTransform();
-    info.color.data[0] = 1.0f;
-    info.color.data[1] = 1.0f;
-    info.color.data[2] = 1.0f;
-    info.color.data[3] = 1.0f;
+    info.color.data[0] = color != nullptr ? color[0] : 1.0f;
+    info.color.data[1] = color != nullptr ? color[1] : 1.0f;
+    info.color.data[2] = color != nullptr ? color[2] : 1.0f;
+    info.color.data[3] = color != nullptr ? color[3] : 1.0f;
     info.texCoordScale[0] = 1.0f;
     info.texCoordScale[1] = 1.0f;
+    info.texCoordOffset[0] = texCoordOffset != nullptr ? texCoordOffset[0] : 0.0f;
+    info.texCoordOffset[1] = texCoordOffset != nullptr ? texCoordOffset[1] : 0.0f;
     info.material = material;
     info.pipelineState = pipelineStateOverride != 0xFFFFFFFFu
         ? pipelineStateOverride
@@ -3700,11 +4629,115 @@ void UploadRasterizedWorldGeometry(const std::vector<QrVertex> &vertices,
     }
 }
 
+std::string ActiveStageTexture(const ShaderStage &stage, float timeSeconds)
+{
+    if (stage.animationMaps.empty() || stage.animationFps <= 0.0f) {
+        return stage.map;
+    }
+    const size_t frame = static_cast<size_t>(
+        std::floor(std::max(timeSeconds, 0.0f) * stage.animationFps)) %
+        stage.animationMaps.size();
+    return stage.animationMaps[frame];
+}
+
+void UploadWorldOverlayGeometry()
+{
+    if (qrayInstance == QR_NULL_HANDLE || !frameStarted || worldOverlayBatches.empty()) {
+        return;
+    }
+
+    const float timeSeconds = static_cast<float>(sceneDef.time) * 0.001f;
+    for (const WorldOverlayBatch &batch : worldOverlayBatches) {
+        const auto definitionIt = shaderDefinitions.find(NormalizeShaderName(batch.shaderName));
+        if (definitionIt == shaderDefinitions.end()) {
+            continue;
+        }
+
+        const ShaderDefinition &definition = definitionIt->second;
+        const size_t firstOverlayStage = definition.tracedBase &&
+            definition.baseStageIndex < definition.stages.size()
+            ? definition.baseStageIndex + 1u
+            : 0u;
+        for (size_t stageIndex = firstOverlayStage;
+             stageIndex < definition.stages.size(); ++stageIndex) {
+            const ShaderStage &stage = definition.stages[stageIndex];
+            const std::string textureName = ActiveStageTexture(stage, timeSeconds);
+            if (textureName.empty() || _stricmp(textureName.c_str(), "$lightmap") == 0) {
+                continue;
+            }
+
+            const QrMaterial material = GetMaterialForTextureName(textureName.c_str());
+            if (material == QR_NO_MATERIAL) {
+                continue;
+            }
+
+            QrBlendFactor source = stage.blendSrc;
+            QrBlendFactor destination = stage.blendDst;
+            uint32_t state = QR_RASTERIZED_GEOMETRY_STATE_DEPTH_TEST;
+            if (stage.blended || stage.blend != QR_GEOMETRY_MATERIAL_BLEND_TYPE_OPAQUE) {
+                state |= QR_RASTERIZED_GEOMETRY_STATE_BLEND_ENABLE;
+            } else {
+                state |= QR_RASTERIZED_GEOMETRY_STATE_DEPTH_WRITE;
+                source = QR_BLEND_FACTOR_ONE;
+                destination = QR_BLEND_FACTOR_ZERO;
+            }
+            if (stage.alphaTested) {
+                state |= QR_RASTERIZED_GEOMETRY_STATE_ALPHA_TEST;
+            }
+
+            const float rgb = EvaluateShaderWave(stage.rgbWave, stage.rgbWaveBase,
+                stage.rgbWaveAmplitude, stage.rgbWavePhase, stage.rgbWaveFrequency, timeSeconds);
+            const float alpha = EvaluateShaderWave(stage.alphaWave, stage.alphaWaveBase,
+                stage.alphaWaveAmplitude, stage.alphaWavePhase, stage.alphaWaveFrequency,
+                timeSeconds);
+            const float color[4] = {rgb, rgb, rgb, alpha};
+            const float offset[2] = {
+                stage.scroll[0] * timeSeconds,
+                stage.scroll[1] * timeSeconds,
+            };
+            UploadRasterizedWorldGeometry(batch.vertices, batch.indices, material,
+                source, destination, state, offset, color);
+        }
+    }
+
+    static size_t loggedBatchCount = 0;
+    if (loggedBatchCount != worldOverlayBatches.size()) {
+        loggedBatchCount = worldOverlayBatches.size();
+        size_t stageCount = 0;
+        for (const WorldOverlayBatch &batch : worldOverlayBatches) {
+            const auto definitionIt = shaderDefinitions.find(NormalizeShaderName(batch.shaderName));
+            if (definitionIt != shaderDefinitions.end()) {
+                stageCount += definitionIt->second.stages.size();
+            }
+        }
+        HostLog("UploadWorldOverlayGeometry: batches=%zu stages=%zu", worldOverlayBatches.size(),
+            stageCount);
+        for (const WorldOverlayBatch &batch : worldOverlayBatches) {
+            const auto definitionIt = shaderDefinitions.find(NormalizeShaderName(batch.shaderName));
+            if (definitionIt == shaderDefinitions.end()) {
+                continue;
+            }
+            for (const ShaderStage &stage : definitionIt->second.stages) {
+                const std::string textureName = ActiveStageTexture(stage, timeSeconds);
+                HostLog("OverlayStage: shader='%s' map='%s' blend=%d src=%d dst=%d "
+                    "animated=%zu dynamic=%d",
+                    batch.shaderName.c_str(), textureName.c_str(),
+                    static_cast<int>(stage.blend), static_cast<int>(stage.blendSrc),
+                    static_cast<int>(stage.blendDst), stage.animationMaps.size(),
+                    stage.dynamic ? 1 : 0);
+            }
+        }
+    }
+}
+
 // The sky is composited by the overlay pass, which runs on top of the traced frame, so the box
 // has to pass the depth test of that frame: the quads sit at the far distance of the map and
 // only background pixels survive. Both windings are emitted because the overlay does not cull.
 void UploadSkyGeometry()
 {
+    if (qrayPhysicalSky != nullptr && qrayPhysicalSky->integer != 0) {
+        return;
+    }
     if (qraySkybox == nullptr || qraySkybox->integer == 0 || qrayInstance == QR_NULL_HANDLE ||
         skyAtlasMaterial == QR_NO_MATERIAL || skyAtlasFaceSize <= 0 || !frameStarted) {
         return;
@@ -4468,10 +5501,11 @@ void UploadTestQuad()
         break;
     }
 
+    const std::vector<QrVertex> meterVertices = QuakeVerticesToMeters(vertices);
     QrRasterizedGeometryUploadInfo info{};
     info.renderType = QR_RASTERIZED_GEOMETRY_RENDER_TYPE_DEFAULT;
-    info.vertexCount = static_cast<uint32_t>(vertices.size());
-    info.pVertices = vertices.data();
+    info.vertexCount = static_cast<uint32_t>(meterVertices.size());
+    info.pVertices = meterVertices.data();
     info.indexCount = static_cast<uint32_t>(indices.size());
     info.pIndices = indices.data();
     info.transform = IdentityTransform();
@@ -4520,6 +5554,8 @@ void UploadPendingSceneGeometry()
                 histogram[RT_RAIL_RINGS], histogram[RT_LIGHTNING], histogram[RT_PORTALSURFACE]);
         }
     }
+
+    UploadWorldOverlayGeometry();
 
     const int skipMask = qraySkipEntities != nullptr ? qraySkipEntities->integer : 0;
     for (const refEntity_t &entity : pendingEntities) {
@@ -4591,28 +5627,128 @@ void DrawFrame()
     resolution.customRenderSize.width = static_cast<uint32_t>(std::max(1, glConfig.vidWidth));
     resolution.customRenderSize.height = static_cast<uint32_t>(std::max(1, glConfig.vidHeight));
 
-    QrDrawFrameSkyParams sky{};
-    if (skyCubemap != QR_EMPTY_CUBEMAP) {
-        sky.skyType = QR_SKY_TYPE_CUBEMAP;
-        sky.skyCubemap = skyCubemap;
-    } else {
-        sky.skyType = QR_SKY_TYPE_COLOR;
-    }
-    sky.skyColorDefault.data[0] = skyAverageColor[0];
-    sky.skyColorDefault.data[1] = skyAverageColor[1];
-    sky.skyColorDefault.data[2] = skyAverageColor[2];
-    sky.skyColorMultiplier = 1.0f;
-    sky.skyColorSaturation = 1.0f;
-    sky.skyAmbientLod = 0.0f;
-    sky.skyLightMultiplier = 1.0f;
-    sky.skyNee = QR_TRUE;
-    sky.skyViewerPosition.data[0] = sceneDef.vieworg[0];
-    sky.skyViewerPosition.data[1] = sceneDef.vieworg[1];
-    sky.skyViewerPosition.data[2] = sceneDef.vieworg[2];
-    sky.godRaysEnabled = QR_FALSE;
+    const float giLevel = std::clamp(CvarFloat(qrayGiLevel, 1.0f), 0.0f, 2.0f);
+    QrDrawFrameIlluminationParams illumination{};
+    illumination.maxBounceShadows = 0;
+    illumination.enableSecondBounceForIndirect = giLevel >= 1.5f ? QR_TRUE : QR_FALSE;
+    illumination.cellWorldSize = std::max(CvarFloat(qrayCellWorldSize, 2.0f), 2.5e-5f);
+    illumination.directDiffuseSensitivityToChange = 0.4f;
+    illumination.indirectDiffuseSensitivityToChange = 0.06f;
+    illumination.specularSensitivityToChange = 0.03f;
+    illumination.polygonalLightSpotlightFactor = 2.0f;
+    illumination.q2DepthGradMode = 1;
+    illumination.q2LightStatsMode = 1;
+    illumination.reflRefrEarlyOut = 1;
+    illumination.neeLightSamples = CvarFloat(qrayNeeSamples, 2.0f) < 1.5f ? 1u : 2u;
+    illumination.restirEnabled = GlobalLightSamplingEnabled() ? 1u : 0u;
+    illumination.restirCandidates = static_cast<uint32_t>(std::clamp(
+        qrayRestirCandidates != nullptr ? qrayRestirCandidates->integer : 8, 1, 64));
+    const bool indirectHalfRes = qrayIndirectHalfRes == nullptr || qrayIndirectHalfRes->integer != 0;
+    illumination.giBounceRays = giLevel > 0.0f && indirectHalfRes ? 0.5f : giLevel;
+    illumination.denoiserEnabled = qrayDenoiser == nullptr || qrayDenoiser->integer != 0
+        ? QR_TRUE : QR_FALSE;
+    illumination.fixedAlbedo = 0.0f;
+    illumination.sunBounceRange = std::max(CvarFloat(qraySunBounceRange, 50.8f), 0.0f);
+    illumination.sunBounceScale = 1.0f;
+    illumination.lightUniqueIdIgnoreFirstPersonViewerShadows = nullptr;
 
+    QrDrawFrameSkyParams sky{};
+    const bool proceduralSky = qrayPhysicalSky == nullptr || qrayPhysicalSky->integer != 0;
+    const bool physicalSun = qrayPhysicalSkySun == nullptr || qrayPhysicalSkySun->integer != 0;
+    if (proceduralSky) {
+        sky.skyType = QR_SKY_TYPE_PROCEDURAL;
+
+        const bool automaticSkyColor = qraySkyColor == nullptr ||
+            qraySkyColor->string == nullptr || qraySkyColor->string[0] == '\0' ||
+            _stricmp(qraySkyColor->string, "auto") == 0;
+        if (automaticSkyColor) {
+            const float maxComponent = std::max(
+                skyAverageColor[0], std::max(skyAverageColor[1], skyAverageColor[2]));
+            if (maxComponent < 0.03f) {
+                sky.skyColorDefault.data[0] = 0.0f;
+                sky.skyColorDefault.data[1] = 0.397f;
+                sky.skyColorDefault.data[2] = 1.0f;
+            } else {
+                const float scale = 0.45f / maxComponent;
+                sky.skyColorDefault.data[0] = std::clamp(skyAverageColor[0] * scale, 0.0f, 1.0f);
+                sky.skyColorDefault.data[1] = std::clamp(skyAverageColor[1] * scale, 0.0f, 1.0f);
+                sky.skyColorDefault.data[2] = std::clamp(skyAverageColor[2] * scale, 0.0f, 1.0f);
+            }
+        } else {
+            const float fallbackSkyColor[3] = {
+                skyAverageColor[0], skyAverageColor[1], skyAverageColor[2],
+            };
+            CvarColor(qraySkyColor, fallbackSkyColor, sky.skyColorDefault);
+        }
+        sky.skyColorMultiplier = kQuakeRaySkyRadianceScale;
+        sky.skyColorSaturation = std::clamp(CvarFloat(qrayCloudOpacity, 1.0f), 0.0f, 1.0f);
+        sky.skyAmbientLod = std::clamp(CvarFloat(qraySkyAmbientLod, 4.0f), 0.0f, 10.0f);
+        const float requestedSkyLightMultiplier = CvarFloat(qraySkyLightMultiplier, 1.0f);
+        sky.skyLightMultiplier = std::clamp(requestedSkyLightMultiplier,
+            0.0f, kQuakeRaySkyLightMultiplierMax);
+        static bool reportedSkyLightClamp = false;
+        if (!reportedSkyLightClamp && requestedSkyLightMultiplier > kQuakeRaySkyLightMultiplierMax) {
+            reportedSkyLightClamp = true;
+            HostLog("DrawFrame: qray_skyLightMultiplier %.2f clamped to %.2f",
+                requestedSkyLightMultiplier, kQuakeRaySkyLightMultiplierMax);
+        }
+        sky.skyNee = QR_TRUE;
+
+        float sunColor[3] = {1.0f, 0.95f, 0.85f};
+        float sunDirection[3] = {0.35f, 0.45f, -0.82f};
+        float sunIntensity = 3.0f;
+        ResolveSun(sunDirection, sunColor, sunIntensity);
+        sky.sunDiscColor.data[0] = physicalSun ? sunColor[0] * sunIntensity : 0.0f;
+        sky.sunDiscColor.data[1] = physicalSun ? sunColor[1] * sunIntensity : 0.0f;
+        sky.sunDiscColor.data[2] = physicalSun ? sunColor[2] * sunIntensity : 0.0f;
+        sky.sunDiscSize = std::max(CvarFloat(qraySunDiscSize, 1.0f), 0.0f);
+
+        const float fallbackCloudColor[3] = {1.0f, 1.0f, 1.0f};
+        QrFloat3D cloudColor{};
+        CvarColor(qrayCloudColor, fallbackCloudColor, cloudColor);
+        float *cloud = &sky.skyCubemapRotationTransform.matrix[0][0];
+        cloud[0] = cloudColor.data[0];
+        cloud[1] = cloudColor.data[1];
+        cloud[2] = cloudColor.data[2];
+        cloud[3] = std::clamp(CvarFloat(qrayCloudCoverage, 0.2f), 0.0f, 1.0f);
+        cloud[4] = std::max(CvarFloat(qrayCloudDensity, 0.8f), 0.0f);
+        cloud[5] = std::max(CvarFloat(qrayCloudSpeed, 0.3f), 0.0f);
+        cloud[6] = qrayClouds == nullptr || qrayClouds->integer != 0 ? 1.0f : 0.0f;
+        cloud[7] = std::max(CvarFloat(qrayCloudHeight, 3500.0f), 1.0f);
+        cloud[8] = std::max(CvarFloat(qrayCloudThickness, 2250.0f), 1.0f);
+        sky.skyCloudsQuality = static_cast<uint32_t>(std::clamp(
+            qrayCloudQuality != nullptr ? qrayCloudQuality->integer : 2,
+            0, static_cast<int>(QR_SKY_CLOUDS_MAX_QUALITY)));
+
+        sky.godRaysEnabled = physicalSun &&
+            (qrayGodRays == nullptr || qrayGodRays->integer != 0) ? QR_TRUE : QR_FALSE;
+        sky.godRaysIntensity = std::max(CvarFloat(qrayGodRaysIntensity, 1.0f), 0.0f);
+        sky.godRaysQuality = static_cast<uint32_t>(std::max(
+            qrayGodRaysQuality != nullptr ? qrayGodRaysQuality->integer : 2, 0));
+        sky.godRaysFromSkyTexture = QR_FALSE;
+    } else {
+        if (skyCubemap != QR_EMPTY_CUBEMAP) {
+            sky.skyType = QR_SKY_TYPE_CUBEMAP;
+            sky.skyCubemap = skyCubemap;
+        } else {
+            sky.skyType = QR_SKY_TYPE_COLOR;
+        }
+        sky.skyColorDefault.data[0] = skyAverageColor[0];
+        sky.skyColorDefault.data[1] = skyAverageColor[1];
+        sky.skyColorDefault.data[2] = skyAverageColor[2];
+        sky.skyColorMultiplier = 1.0f;
+        sky.skyColorSaturation = 1.0f;
+        sky.skyAmbientLod = std::clamp(CvarFloat(qraySkyAmbientLod, 4.0f), 0.0f, 10.0f);
+        sky.skyLightMultiplier = std::max(CvarFloat(qraySkyLightMultiplier, 1.0f), 0.0f);
+        sky.skyNee = QR_TRUE;
+        sky.godRaysEnabled = QR_FALSE;
+    }
+    QuakePositionToMeters(sceneDef.vieworg, sky.skyViewerPosition);
+
+    refdef_t sdkSceneDef = sceneDef;
+    QuakePositionToMeters(sceneDef.vieworg, sdkSceneDef.vieworg);
     QrDrawFrameInfo info{};
-    BuildViewMatrix(sceneDef, info.view);
+    BuildViewMatrix(sdkSceneDef, info.view);
     info.worldUpVector.data[0] = 0.0f;
     info.worldUpVector.data[1] = 0.0f;
     info.worldUpVector.data[2] = 1.0f;
@@ -4624,9 +5760,9 @@ void DrawFrame()
         fovYRadians = 2.0f * std::atan(std::tan(sceneDef.fov_x * (kPi / 360.0f)) / aspect);
     }
     info.fovYRadians = fovYRadians;
-    info.cameraNear = 0.1f;
-    info.cameraFar = 8192.0f;
-    info.rayLength = 10000.0f;
+    info.cameraNear = QuakeUnitsToMeters(0.1f);
+    info.cameraFar = QuakeUnitsToMeters(8192.0f);
+    info.rayLength = QuakeUnitsToMeters(10000.0f);
     info.rayCullMaskWorld = QR_DRAW_FRAME_RAY_CULL_WORLD_0_BIT |
         QR_DRAW_FRAME_RAY_CULL_WORLD_1_BIT |
         QR_DRAW_FRAME_RAY_CULL_SKY_BIT;
@@ -4636,6 +5772,7 @@ void DrawFrame()
     info.disableEyeAdaptation = qrayEyeAdaptation->integer ? QR_FALSE : QR_TRUE;
     info.forceAntiFirefly = QR_TRUE;
     info.pRenderResolutionParams = &resolution;
+    info.pIlluminationParams = &illumination;
     info.pSkyParams = &sky;
 
     QrDrawFrameTonemappingParams tonemapping{};
@@ -4702,12 +5839,14 @@ void ShutdownRenderer(refShutdownCode_t code)
         ri.Cmd_RemoveCommand("screenshot");
         ri.Cmd_RemoveCommand("screenshotJPEG");
         ri.Cmd_RemoveCommand("qray_readback");
+        ri.Cmd_RemoveCommand("qray_probe");
         commandsRegistered = false;
     }
 
     ResetMaterialState();
     frameStarted = false;
     sceneValid = false;
+    probeSceneValid = false;
 
     if (code != REF_KEEP_CONTEXT && code != REF_KEEP_WINDOW) {
         ri.VKimp_Shutdown(code == REF_UNLOAD_DLL ? qtrue : qfalse);
@@ -4734,6 +5873,12 @@ void BeginRegistration(glconfig_t *config)
         if (!CreateQrayInstance()) {
             HostLog("BeginRegistration: CreateQrayInstance failed");
             ri.Printf(PRINT_WARNING, "rendererqray: QuakeRay initialization failed; check qray_shaderDir and qray_blueNoise, or use cl_renderer vulkan\n");
+            return;
+        }
+        if (!ConfigureSpatialConvention()) {
+            qrDestroyInstance(qrayInstance);
+            qrayInstance = QR_NULL_HANDLE;
+            HostLog("BeginRegistration: ConfigureSpatialConvention failed");
             return;
         }
         HostLog("BeginRegistration: CreateDefaultMaterial");
@@ -4768,6 +5913,7 @@ void BeginRegistration(glconfig_t *config)
         ri.Cmd_AddCommand("screenshot", QrayScreenshot_f);
         ri.Cmd_AddCommand("screenshotJPEG", QrayScreenshot_f);
         ri.Cmd_AddCommand("qray_readback", QrayReadbackDump_f);
+        ri.Cmd_AddCommand("qray_probe", QrayProbe_f);
         commandsRegistered = true;
     }
 }
@@ -4842,6 +5988,209 @@ void QrayReadbackDump_f()
     ri.Printf(PRINT_ALL, "rendererqray: wrote %s (%ux%u)\n", name, width, height);
 }
 
+void QrayProbe_f()
+{
+    static int probeSequence = 0;
+    const int sequence = ++probeSequence;
+    if (!probeSceneValid || markTriangles.empty()) {
+        ProbeLog("QRAY_PROBE seq=%d status=NO_SCENE map=%s triangles=%zu",
+            sequence, pendingWorldName.c_str(), markTriangles.size());
+        ri.Printf(PRINT_WARNING, "rendererqray: qray_probe has no loaded world scene\n");
+        return;
+    }
+
+    const float *origin = probeSceneDef.vieworg;
+    float direction[3] = {
+        probeSceneDef.viewaxis[0][0],
+        probeSceneDef.viewaxis[0][1],
+        probeSceneDef.viewaxis[0][2],
+    };
+    NormalizeVector(direction);
+    if (direction[0] == 0.0f && direction[1] == 0.0f && direction[2] == 0.0f) {
+        ProbeLog("QRAY_PROBE seq=%d status=INVALID_VIEW map=%s", sequence, pendingWorldName.c_str());
+        ri.Printf(PRINT_WARNING, "rendererqray: qray_probe has an invalid view direction\n");
+        return;
+    }
+
+    struct ProbeHit
+    {
+        const MarkTriangle *triangle = nullptr;
+        float distance = FLT_MAX;
+        float u = 0.0f;
+        float v = 0.0f;
+        float facing = 0.0f;
+        bool frontFacing = false;
+    };
+
+    ProbeHit nearestAny;
+    ProbeHit nearestFront;
+    constexpr float probeDistance = 32768.0f;
+    float hitDistance = 0.0f;
+    float hitU = 0.0f;
+    float hitV = 0.0f;
+    for (const MarkTriangle &triangle : markTriangles) {
+        if (!RayIntersectsTriangle(triangle, origin, direction, probeDistance,
+                hitDistance, &hitU, &hitV)) {
+            continue;
+        }
+
+        const float facing = triangle.normal[0] * direction[0] +
+            triangle.normal[1] * direction[1] +
+            triangle.normal[2] * direction[2];
+        if (hitDistance < nearestAny.distance) {
+            nearestAny.triangle = &triangle;
+            nearestAny.distance = hitDistance;
+            nearestAny.u = hitU;
+            nearestAny.v = hitV;
+            nearestAny.facing = facing;
+            nearestAny.frontFacing = facing < -0.001f;
+        }
+        if (facing < -0.001f && hitDistance < nearestFront.distance) {
+            nearestFront.triangle = &triangle;
+            nearestFront.distance = hitDistance;
+            nearestFront.u = hitU;
+            nearestFront.v = hitV;
+            nearestFront.facing = facing;
+            nearestFront.frontFacing = true;
+        }
+    }
+
+    if (nearestAny.triangle == nullptr) {
+        ProbeLog("QRAY_PROBE seq=%d status=NO_HIT map=%s origin=(%.3f %.3f %.3f) "
+            "dir=(%.6f %.6f %.6f) tested=%zu",
+            sequence, pendingWorldName.c_str(), origin[0], origin[1], origin[2],
+            direction[0], direction[1], direction[2], markTriangles.size());
+        ri.Printf(PRINT_ALL, "rendererqray: qray_probe #%d: no world triangle hit\n", sequence);
+        return;
+    }
+
+    const ProbeHit &primary = nearestFront.triangle != nullptr ? nearestFront : nearestAny;
+    const MarkTriangle &triangle = *primary.triangle;
+    const float barycentric[3] = {1.0f - primary.u - primary.v, primary.u, primary.v};
+    float hitPoint[3] = {};
+    float hitUv[2] = {};
+    float interpolatedNormal[3] = {};
+    for (int axis = 0; axis < 3; ++axis) {
+        hitPoint[axis] = origin[axis] + direction[axis] * primary.distance;
+        for (int corner = 0; corner < 3; ++corner) {
+            interpolatedNormal[axis] += triangle.vertexNormals[corner][axis] *
+                barycentric[corner];
+        }
+    }
+    for (int axis = 0; axis < 2; ++axis) {
+        for (int corner = 0; corner < 3; ++corner) {
+            hitUv[axis] += triangle.texCoords[corner][axis] * barycentric[corner];
+        }
+    }
+    NormalizeVector(interpolatedNormal);
+
+    const char *shaderName = "_unknown";
+    const WorldSurfaceInfo *surfaceInfo = nullptr;
+    if (triangle.sourceSurfaceIndex >= 0 &&
+        static_cast<size_t>(triangle.sourceSurfaceIndex) < worldSurfaceInfos.size()) {
+        surfaceInfo = &worldSurfaceInfos[static_cast<size_t>(triangle.sourceSurfaceIndex)];
+        if (surfaceInfo->valid && surfaceInfo->shaderNum >= 0 &&
+            static_cast<size_t>(surfaceInfo->shaderNum) < worldShaderNames.size()) {
+            shaderName = worldShaderNames[static_cast<size_t>(surfaceInfo->shaderNum)].c_str();
+        }
+    }
+
+    const ShaderDefinition *definition = nullptr;
+    const auto definitionIt = shaderDefinitions.find(NormalizeShaderName(shaderName));
+    if (definitionIt != shaderDefinitions.end()) {
+        definition = &definitionIt->second;
+    }
+    const char *textureName = definition != nullptr && !definition->map.empty()
+        ? definition->map.c_str()
+        : shaderName;
+    const int shaderNum = surfaceInfo != nullptr ? surfaceInfo->shaderNum : -1;
+    const QrMaterial material = shaderNum >= 0 &&
+        static_cast<size_t>(shaderNum) < shaderMaterials.size()
+        ? shaderMaterials[static_cast<size_t>(shaderNum)]
+        : QR_NO_MATERIAL;
+
+    float generatedDotWinding = 0.0f;
+    float authoredDotGenerated = 0.0f;
+    float vertexNormalDotWinding = 0.0f;
+    if (surfaceInfo != nullptr) {
+        for (int axis = 0; axis < 3; ++axis) {
+            generatedDotWinding += surfaceInfo->generatedNormal[axis] *
+                surfaceInfo->originalWindingNormal[axis];
+            authoredDotGenerated += surfaceInfo->authoredNormal[axis] *
+                surfaceInfo->generatedNormal[axis];
+            vertexNormalDotWinding += interpolatedNormal[axis] * triangle.normal[axis];
+        }
+    }
+
+    const int cluster = ClusterIndexForPoint(hitPoint);
+    const char *tag = primary.frontFacing ? "QRAY_PROBE" : "QRAY_PROBE_BACKFACE";
+    ProbeLog("%s seq=%d status=HIT map=%s origin=(%.3f %.3f %.3f) "
+        "dir=(%.6f %.6f %.6f) tested=%zu surface=%d batchTri=%u shaderNum=%d "
+        "shader=%s texture=%s material=%d type=%s flags=0x%08x contents=0x%08x "
+        "distance=%.3f point=(%.3f %.3f %.3f) uv=(%.6f %.6f) cluster=%d "
+        "front=%d rayDotNormal=%.6f triNormal=(%.6f %.6f %.6f) "
+        "vertexNormal=(%.6f %.6f %.6f) generatedNormal=(%.6f %.6f %.6f) "
+        "authoredNormal=(%.6f %.6f %.6f) originalWinding=(%.6f %.6f %.6f) "
+        "uploadedWinding=(%.6f %.6f %.6f) genDotWinding=%.6f "
+        "authoredDotGenerated=%.6f vertexNormalDotWinding=%.6f windingFlipped=%d "
+        "planarWindingKept=%d alphaTested=%d blend=%d darkenDecal=%d envMap=%d "
+        "lightmap=%d lightmapSize=%dx%d patch=%dx%d verts=%d indexes=%d",
+        tag, sequence, pendingWorldName.c_str(), origin[0], origin[1], origin[2],
+        direction[0], direction[1], direction[2], markTriangles.size(),
+        triangle.sourceSurfaceIndex, triangle.sourceTriangleIndex, shaderNum,
+        shaderName, textureName, static_cast<int>(material),
+        surfaceInfo != nullptr ? SurfaceTypeName(surfaceInfo->surfaceType) : "UNKNOWN",
+        surfaceInfo != nullptr ? surfaceInfo->surfaceFlags : 0,
+        surfaceInfo != nullptr ? surfaceInfo->contentFlags : 0,
+        primary.distance, hitPoint[0], hitPoint[1], hitPoint[2], hitUv[0], hitUv[1],
+        cluster, primary.frontFacing ? 1 : 0, primary.facing,
+        triangle.normal[0], triangle.normal[1], triangle.normal[2],
+        interpolatedNormal[0], interpolatedNormal[1], interpolatedNormal[2],
+        surfaceInfo != nullptr ? surfaceInfo->generatedNormal[0] : 0.0f,
+        surfaceInfo != nullptr ? surfaceInfo->generatedNormal[1] : 0.0f,
+        surfaceInfo != nullptr ? surfaceInfo->generatedNormal[2] : 0.0f,
+        surfaceInfo != nullptr ? surfaceInfo->authoredNormal[0] : 0.0f,
+        surfaceInfo != nullptr ? surfaceInfo->authoredNormal[1] : 0.0f,
+        surfaceInfo != nullptr ? surfaceInfo->authoredNormal[2] : 0.0f,
+        surfaceInfo != nullptr ? surfaceInfo->originalWindingNormal[0] : 0.0f,
+        surfaceInfo != nullptr ? surfaceInfo->originalWindingNormal[1] : 0.0f,
+        surfaceInfo != nullptr ? surfaceInfo->originalWindingNormal[2] : 0.0f,
+        surfaceInfo != nullptr ? surfaceInfo->uploadedWindingNormal[0] : 0.0f,
+        surfaceInfo != nullptr ? surfaceInfo->uploadedWindingNormal[1] : 0.0f,
+        surfaceInfo != nullptr ? surfaceInfo->uploadedWindingNormal[2] : 0.0f,
+        generatedDotWinding, authoredDotGenerated, vertexNormalDotWinding,
+        surfaceInfo != nullptr && surfaceInfo->windingFlipped ? 1 : 0,
+        surfaceInfo != nullptr && surfaceInfo->planarWindingKept ? 1 : 0,
+        surfaceInfo != nullptr && surfaceInfo->alphaTested ? 1 : 0,
+        definition != nullptr ? static_cast<int>(definition->blend) : -1,
+        definition != nullptr && definition->darkenDecal ? 1 : 0,
+        definition != nullptr && definition->environmentMap ? 1 : 0,
+        surfaceInfo != nullptr ? surfaceInfo->lightmapNum : -1,
+        surfaceInfo != nullptr ? surfaceInfo->lightmapWidth : 0,
+        surfaceInfo != nullptr ? surfaceInfo->lightmapHeight : 0,
+        surfaceInfo != nullptr ? surfaceInfo->patchWidth : 0,
+        surfaceInfo != nullptr ? surfaceInfo->patchHeight : 0,
+        surfaceInfo != nullptr ? surfaceInfo->numVerts : 0,
+        surfaceInfo != nullptr ? surfaceInfo->numIndexes : 0);
+
+    if (nearestAny.triangle != nullptr && !nearestAny.frontFacing &&
+        (nearestFront.triangle == nullptr || nearestAny.distance < nearestFront.distance)) {
+        ProbeLog("QRAY_PROBE_BACKFACE seq=%d map=%s surface=%d distance=%.3f "
+            "frontSurface=%d frontDistance=%.3f recommendedFix=%s",
+            sequence, pendingWorldName.c_str(), nearestAny.triangle->sourceSurfaceIndex,
+            nearestAny.distance,
+            nearestFront.triangle != nullptr ? nearestFront.triangle->sourceSurfaceIndex : -1,
+            nearestFront.triangle != nullptr ? nearestFront.distance : -1.0f,
+            "inspect winding, generated normal and authored drawVert normals");
+    }
+
+    ri.Printf(PRINT_ALL,
+        "rendererqray: qray_probe #%d: %s surface=%d dist=%.1f front=%d texture=%s\n",
+        sequence, SurfaceTypeName(surfaceInfo != nullptr ? surfaceInfo->surfaceType : MST_BAD),
+        triangle.sourceSurfaceIndex, primary.distance, primary.frontFacing ? 1 : 0,
+        textureName);
+}
+
 void LoadWorld(const char *name)
 {
     HostLog("LoadWorld: name=%s instance=%p", name != nullptr ? name : "(null)", qrayInstance);
@@ -4850,6 +6199,7 @@ void LoadWorld(const char *name)
     }
     pendingWorldName = name;
     worldLoaded = false;
+    probeSceneValid = false;
 }
 
 void ClearScene()
@@ -4896,28 +6246,59 @@ int LightForPoint(vec3_t point, vec3_t ambientLight, vec3_t directedLight, vec3_
     return 0;
 }
 
+void AddDynamicLight(const float origin[3], float radius, float r, float g, float b,
+    bool additive, bool linear)
+{
+    if (origin == nullptr || radius <= 0.0f || dynamicLights.size() >= MAX_DLIGHTS) {
+        return;
+    }
+
+    DynamicLight light{};
+    light.origin[0] = origin[0];
+    light.origin[1] = origin[1];
+    light.origin[2] = origin[2];
+    light.color[0] = std::max(r, 0.0f);
+    light.color[1] = std::max(g, 0.0f);
+    light.color[2] = std::max(b, 0.0f);
+    light.radius = radius;
+    light.additive = additive;
+    light.linear = linear;
+    dynamicLights.push_back(light);
+}
+
 void AddLightToScene(const vec3_t org, float intensity, float r, float g, float b)
 {
-    (void)org;
-    (void)intensity;
-    (void)r;
-    (void)g;
-    (void)b;
+    AddDynamicLight(org, intensity, r, g, b, false, false);
 }
 
 void AddAdditiveLightToScene(const vec3_t org, float intensity, float r, float g, float b)
 {
-    AddLightToScene(org, intensity, r, g, b);
+    AddDynamicLight(org, intensity, r, g, b, true, false);
 }
 
 void AddLinearLightToScene(const vec3_t start, const vec3_t end, float intensity, float r, float g, float b)
 {
-    (void)start;
-    (void)end;
-    (void)intensity;
-    (void)r;
-    (void)g;
-    (void)b;
+    if (start == nullptr || end == nullptr || intensity <= 0.0f) {
+        return;
+    }
+
+    const float delta[3] = {
+        end[0] - start[0], end[1] - start[1], end[2] - start[2],
+    };
+    const float lengthSquared = delta[0] * delta[0] + delta[1] * delta[1] +
+        delta[2] * delta[2];
+    if (lengthSquared <= 1.0e-6f) {
+        AddDynamicLight(start, intensity, r, g, b, false, false);
+        return;
+    }
+
+    const float midpoint[3] = {
+        (start[0] + end[0]) * 0.5f,
+        (start[1] + end[1]) * 0.5f,
+        (start[2] + end[2]) * 0.5f,
+    };
+    const float radius = std::max(intensity, std::sqrt(lengthSquared) * 0.5f);
+    AddDynamicLight(midpoint, radius, r, g, b, false, true);
 }
 
 void RenderScene(const refdef_t *fd)
@@ -4933,6 +6314,8 @@ void RenderScene(const refdef_t *fd)
         sceneRendered = true;
         if (worldScene) {
             frameHasWorldScene = true;
+            probeSceneDef = *fd;
+            probeSceneValid = true;
         }
         if (firstWorldScene) {
             UploadPendingSceneGeometry();
@@ -5066,7 +6449,7 @@ void EndFrame(int *frontEndMsec, int *backEndMsec)
 }
 
 bool RayIntersectsTriangle(const MarkTriangle &triangle, const float origin[3], const float direction[3],
-    float maxDistance, float &hitDistance)
+    float maxDistance, float &hitDistance, float *outU = nullptr, float *outV = nullptr)
 {
     const float *v0 = triangle.points[0];
     const float *v1 = triangle.points[1];
@@ -5105,6 +6488,12 @@ bool RayIntersectsTriangle(const MarkTriangle &triangle, const float origin[3], 
        return false;
     }
     hitDistance = distance;
+    if (outU != nullptr) {
+        *outU = u;
+    }
+    if (outV != nullptr) {
+        *outV = v;
+    }
     return true;
 }
 

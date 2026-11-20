@@ -30,6 +30,9 @@ This tree implements the first integration stage:
   lights, additionally aggregated into per-cluster light lists from the BSP
   cluster tree and PVS so direct lighting only samples the lights that can reach
   the hit point.
+- QuakeRaySDK 0.2.0 spatial contract: Q3 keeps its native units internally and
+  converts positions, radii, reaches, cluster bounds and camera distances to
+  meters at the `qr*` API boundary.
 - MD3 model loading, frame interpolation, tags, bounds, model skins and dynamic
   scene geometry for world entities and first-person view models. Surfaces whose
   shader stage is a `tcGen environment` pass get rebuilt sphere-map texcoords; both the
@@ -53,17 +56,31 @@ Requirements:
 
 - Windows x64 and Visual Studio 2022 (MSVC).
 - Vulkan SDK 1.4.318 or newer.
-- NVRHI source tree.
-- QuakeRaySDK source at API `1.04.0000` or newer, with its FidelityFX SDK
-  dependency present at `Source/FidelityFX_SDK_1.1.4`.
+- NVRHI source tree at the SDK-compatible pin with `c_MaxBindingLayouts >= 13`.
+- QuakeRaySDK submodule at `code/quakeraysdk` (`0.2.0`, C ABI `1.06.0000`).
+  Its FidelityFX SDK dependency is present at
+  `code/quakeraysdk/Source/FidelityFX_SDK_1.1.4`.
 
-Configure and build from this directory:
+Initialize the submodule from the repository root, then configure and build:
 
 ```powershell
+# From the repository root:
+git submodule update --init --recursive
+
+cd code/rendererqray
 cmake -S . -B build -G "Visual Studio 17 2022" -A x64 `
-  -DQUAKERAY_SDK_DIR="C:/path/to/QuakeRaySDK" `
   -DQR_NVRHI_SOURCE_DIR="C:/path/to/nvrhi"
 cmake --build build --config Debug --target rendererqray
+```
+
+`QUAKERAY_SDK_DIR` defaults to `code/quakeraysdk` and only needs to be set when
+building against an external SDK checkout.
+
+If NVRHI is at the SDK-compatible upstream pin but still has the stock binding
+layout limit, apply:
+
+```powershell
+git -C C:/path/to/nvrhi apply C:/path/to/q3-rt/code/quakeraysdk/cmake/nvrhi-max-binding-layouts.patch
 ```
 
 `QR_FFX_SDK_ROOT` can be passed explicitly if the SDK uses a different
@@ -105,11 +122,60 @@ directory whose `baseq3` points at a retail Quake 3 installation:
 
 ```powershell
 .\quake3e.x64.exe +set cl_renderer qray `
-  +set qray_shaderDir "C:/path/to/QuakeRaySDK/Build/" `
-  +set qray_blueNoise "C:/path/to/QuakeRaySDK/gfx/textures/BlueNoise_LDR_RGBA_128.png" `
-  +set qray_waterNormal "C:/path/to/QuakeRaySDK/gfx/textures/WaterNormal_n.png" `
+  +set qray_shaderDir "C:/path/to/q3-rt/code/quakeraysdk/Build/" `
+  +set qray_blueNoise "C:/path/to/quake-assets/gfx/textures/BlueNoise_LDR_RGBA_128.png" `
+  +set qray_waterNormal "C:/path/to/quake-assets/gfx/textures/WaterNormal_n.png" `
   +set r_fullscreen 0 +map q3dm1
 ```
+
+## Spatial contract
+
+QuakeRaySDK accepts spatial values only in meters. `rendererqray` keeps BSP,
+MD3, picking and debug data in native Quake 3 units and converts copies at the
+renderer API boundary using QuakeRay's reference scale of 40 Quake units per
+meter.
+
+- All geometry positions and world-space raster vertices are converted.
+- Camera translation, near/far, ray length and `skyViewerPosition` are
+  converted; directions, FOV, normals, UVs and topology are not.
+- Light positions, emission radii, cluster reaches, cluster AABBs and
+  `qray_lightTopUp` are converted. Light power is unchanged; cluster IDs are
+  remapped below.
+- Q3 cluster `c` is remapped to SDK cluster `c + 1`, because the SDK reserves
+  cluster 0. PVS rows are stored at the remapped index and the SDK's row bit `c`
+  then resolves to the same SDK cluster `c + 1`.
+- HUD and other `SWAPCHAIN` raster geometry remain in pixels.
+- `qray_probe` reports Q3 units and SDK cluster IDs because it inspects the
+  uploaded scene topology.
+
+The instance declares identity right-handed `+X/+Y/+Z` axes, matching Quake 3's
+Z-up world, with `qrSetSpatialConvention` before the first upload or frame.
+
+## Presentation, GI and denoising
+
+The normal frame loop uses `QR_PRESENT_MODE_VSYNC` with `maxFrameLatency = 1`.
+`qray_uncapped 1` is a temporary benchmark-only mode that selects `IMMEDIATE`
+and zero present wait.
+
+The host now supplies explicit `QrDrawFrameIlluminationParams` instead of
+leaving the SDK fallback: one GI bounce by default, two NEE samples, the
+reference temporal sensitivities, a 2 m GI cell, and the denoiser enabled.
+
+| Cvar | Default | Description |
+| --- | --- | --- |
+| `qray_giLevel` | `1` | `0` disables GI, `1` enables one bounce, `2` enables the second bounce. |
+| `qray_denoiser` | `1` | Enable the QuakeRay temporal denoiser. |
+| `qray_neeSamples` | `2` | Direct-light samples, clamped to 1 or 2. |
+| `qray_restir` | `0` | Use global ReSTIR selection instead of cluster lists. |
+| `qray_restirCandidates` | `8` | ReSTIR candidates per light sample. |
+| `qray_cellWorldSize` | `2.0` | GI/ReSTIR spatial cell size in metres. |
+| `qray_sunBounceRange` | `50.8` | Sun reach into an indirect bounce in metres. |
+| `qray_indirectHalfRes` | `1` | Full-resolution primary rays, half-resolution indirect rays. |
+
+All Q3 dynamic-light callbacks (`AddLightToScene`, additive and linear forms)
+are collected per frame and uploaded as spherical cluster light sources. Linear
+lights use a midpoint/radius proxy. `qray_dlightScale` controls their relative
+intensity.
 
 ## Lifetime contract
 
@@ -136,6 +202,24 @@ readback frame as a 32-bit BMP. `screenshot [file.png]` uses the SDK screenshot
 request path instead. With the same frame on screen, the BMP and PNG should match
 apart from timing and HUD animation.
 
+## World texture probe
+
+`qray_probe` casts a ray through the centre of the current world view and appends
+the hit surface to `%TEMP%\qray_probe.log` on every invocation. It reports the
+BSP shader and resolved texture, flags, surface type, UV, cluster, material,
+windings and the authored/generated normals. A nearer back-facing triangle is
+also recorded separately as `QRAY_PROBE_BACKFACE`, because QuakeRay culls it from
+the visible primary-ray result.
+
+Bind it to a spare key before walking the maps:
+
+```text
+bind p qray_probe
+```
+
+The command only selects BSP world geometry. Models, sprites and bmodels are not
+part of the world pick set yet.
+
 ## Sky and sun
 
 Retail Quake 3 bakes the `q3map_sun` directive of the sky shader into the lightmaps, so an RT
@@ -149,6 +233,22 @@ The retail sky textures carry no sun disc, because the sun only ever existed in 
 The sidecar therefore burns one into the sky atlas: a saturated core of about one degree with a
 seven degree glow, placed on the direction taken from the same `q3map_sun` that feeds the
 directional light, so light and disc can not drift apart. Skies without `q3map_sun` get no disc.
+
+By default the renderer uses QuakeRay's procedural sky instead of that atlas:
+
+- `qray_physicalSky 1` selects `QR_SKY_TYPE_PROCEDURAL`.
+- `qray_physicalSkySun 1` uploads the map sun as the directional light and visible disc.
+- `qray_clouds 1` enables the volumetric cloud layer.
+- `qray_godRays 1` enables procedural sun shafts.
+- `qray_skyColor`, `qray_cloudColor`, cloud coverage/density/speed/height/thickness,
+  cloud opacity/quality and god-ray intensity/quality are exposed as `qray_*` cvars.
+- `qray_physicalSkySunPitch` and `qray_physicalSkyYaw` override the map sun direction;
+  `-1000` keeps the `q3map_sun` values. `qray_physicalSkyPower` controls sun power
+  from `0` to `100`.
+- `qray_skyAmbientLod` and `qray_skyLightMultiplier` control how physical sky
+  contributes to scene lighting independently of the visible sky.
+
+Set `qray_physicalSky 0` to return to the map-texture sky atlas and its scripted sun disc.
 
 QuakeRay only samples the sky from the cubemap its own sky pass rasterizes, which a sidecar
 cannot feed, so `DrawFrame` reported `QR_SKY_TYPE_CUBEMAP` and the traced pass fell through to
