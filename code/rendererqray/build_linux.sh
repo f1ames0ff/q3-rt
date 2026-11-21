@@ -38,11 +38,17 @@ if [[ ! -f "$ffx_so" ]]; then
 fi
 
 echo "== Configuring rendererqray ($config)"
+extra_args=()
+if [[ -n "${VULKAN_HEADERS_DIR:-}" ]]; then
+    # NVRHI needs Vulkan headers >= 1.4.318; distro headers are often older.
+    extra_args+=("-DVulkan_INCLUDE_DIR=$VULKAN_HEADERS_DIR")
+fi
 cmake -S "$script_dir" -B "$build_dir" \
     -DCMAKE_BUILD_TYPE="$config" \
     -DQR_NVRHI_SOURCE_DIR="$QR_NVRHI_SOURCE_DIR" \
     -DQUAKERAY_SDK_DIR="$sdk_dir" \
-    -DQR_FFX_VK_SO="$ffx_so"
+    -DQR_FFX_VK_SO="$ffx_so" \
+    "${extra_args[@]}"
 
 echo "== Building rendererqray"
 cmake --build "$build_dir" --target rendererqray --parallel

@@ -106,6 +106,11 @@ cvar_t *qrayEnvShellScale = nullptr;
 cvar_t *qrayLightScale = nullptr;
 cvar_t *qrayLightRadiusScale = nullptr;
 cvar_t *qrayLightRadius = nullptr;
+cvar_t *qraySurfaceLights = nullptr;
+cvar_t *qrayUpscale = nullptr;
+cvar_t *qraySurfaceLightScale = nullptr;
+cvar_t *qraySurfaceLightMax = nullptr;
+cvar_t *qraySurfaceLightGlow = nullptr;
 cvar_t *qrayLightTopUp = nullptr;
 cvar_t *qrayDlightScale = nullptr;
 cvar_t *qrayViewMode = nullptr;
@@ -363,7 +368,30 @@ struct ShaderDefinition
     bool tracedBase = false;
     size_t baseStageIndex = static_cast<size_t>(-1);
     std::vector<ShaderStage> stages;
+    // q3map light emission. Retail Q3 bakes these into the lightmaps; the RT renderer turns
+    // them into area lights (torch flames, light fixtures, lava).
+    float surfaceLight = 0.0f;
+    std::string lightImage;
+    std::string editorImage;
+    bool hasLightRGB = false;
+    float lightRGB[3] = {1.0f, 1.0f, 1.0f};
+    bool twoSided = false;
 };
+
+// One emitting triangle of a q3map_surfacelight surface, in Quake units. power already holds
+// the q3map photon budget (surfacelight * area * areaScale / pointScale) times the light colour;
+// qray_lightScale and qray_surfaceLightScale are applied at upload time.
+struct SurfaceEmitter
+{
+    float points[3][3];
+    float centroid[3];
+    float normal[3];
+    float power[3];
+    float area;
+    uint32_t cluster;
+};
+std::vector<SurfaceEmitter> surfaceEmitters;
+constexpr uint64_t kSurfaceLightUniqueIdBase = 0x200000000ull;
 
 // Q3 skies are either a six sided box (skyparms <box> ...) or a stack of scrolling
 // cloud layers projected onto a dome. Both are baked into a cubemap on map load.
@@ -838,6 +866,22 @@ void RegisterCvars()
     ri.Cvar_SetDescription(qrayLightRadius,
         "Emission sphere radius of a Quake 3 map light, in Quake units. Small values behave like point lights.");
 
+    qrayUpscale = ri.Cvar_Get("qray_upscale", "1", CVAR_ARCHIVE);
+    ri.Cvar_SetDescription(qrayUpscale,
+        "Upscaler: 0 = linear (no temporal AA), 1 = FSR 3 native AA, 2 = FSR quality, 3 = FSR balanced, 4 = FSR performance.");
+    qraySurfaceLights = ri.Cvar_Get("qray_surfaceLights", "1", CVAR_ARCHIVE | CVAR_LATCH);
+    ri.Cvar_SetDescription(qraySurfaceLights,
+        "Turn q3map_surfacelight surfaces (torch flames, light fixtures, lava) into QuakeRay area lights. Applied on map load.");
+    qraySurfaceLightScale = ri.Cvar_Get("qray_surfaceLightScale", "1", CVAR_ARCHIVE);
+    ri.Cvar_SetDescription(qraySurfaceLightScale,
+        "Intensity multiplier of q3map_surfacelight area lights, on top of qray_lightScale.");
+    qraySurfaceLightMax = ri.Cvar_Get("qray_surfaceLightMax", "2048", CVAR_ARCHIVE | CVAR_LATCH);
+    ri.Cvar_SetDescription(qraySurfaceLightMax,
+        "Maximum number of surface light triangles per map; the dimmest are dropped above it. The SDK light array holds 4096 lights in total.");
+    qraySurfaceLightGlow = ri.Cvar_Get("qray_surfaceLightGlow", "1", CVAR_ARCHIVE | CVAR_LATCH);
+    ri.Cvar_SetDescription(qraySurfaceLightGlow,
+        "Write an emission mask into the materials of q3map_surfacelight shaders so the light surfaces themselves glow.");
+
     qrayLightTopUp = ri.Cvar_Get("qray_lightTopUp", "1024", CVAR_ARCHIVE);
     ri.Cvar_SetDescription(qrayLightTopUp,
         "Distance in Quake units within which clusters receive lights their PVS row does not list.");
@@ -1090,7 +1134,8 @@ bool LoadQ3Texture(const char *shaderName, int &width, int &height, std::vector<
 }
 
 QrMaterial CreateMaterialFromPixels(const char *name, int width, int height,
-    const std::vector<uint8_t> &albedo, QrSamplerAddressMode addressMode)
+    const std::vector<uint8_t> &albedo, QrSamplerAddressMode addressMode,
+    const std::vector<uint8_t> *emission = nullptr)
 {
     if (width <= 0 || height <= 0 || albedo.size() < static_cast<size_t>(width) * height * 4) {
         return QR_NO_MATERIAL;
@@ -1102,7 +1147,8 @@ QrMaterial CreateMaterialFromPixels(const char *name, int width, int height,
     for (size_t i = 0; i < pixelCount; ++i) {
         roughnessMetallicEmission[i * 4 + 0] = 200;
         roughnessMetallicEmission[i * 4 + 1] = 0;
-        roughnessMetallicEmission[i * 4 + 2] = 0;
+        roughnessMetallicEmission[i * 4 + 2] =
+            (emission != nullptr && i < emission->size()) ? (*emission)[i] : 0;
         roughnessMetallicEmission[i * 4 + 3] = 255;
 
         normal[i * 4 + 0] = 128;
@@ -1481,6 +1527,12 @@ void LoadShaderScripts()
         bool preferredStageChosen = false;
         size_t preferredStageIndex = static_cast<size_t>(-1);
         bool currentTransparentSurface = false;
+        float currentSurfaceLight = 0.0f;
+        std::string currentLightImage;
+        std::string currentEditorImage;
+        bool currentHasLightRGB = false;
+        float currentLightRGB[3] = {1.0f, 1.0f, 1.0f};
+        bool currentTwoSided = false;
         std::vector<ShaderStage> currentStages;
         ShaderStage currentStage;
         SkyShaderInfo currentSky;
@@ -1515,6 +1567,12 @@ void LoadShaderScripts()
                     preferredStageChosen = false;
                     preferredStageIndex = static_cast<size_t>(-1);
                     currentTransparentSurface = false;
+                    currentSurfaceLight = 0.0f;
+                    currentLightImage.clear();
+                    currentEditorImage.clear();
+                    currentHasLightRGB = false;
+                    currentLightRGB[0] = currentLightRGB[1] = currentLightRGB[2] = 1.0f;
+                    currentTwoSided = false;
                     currentStages.clear();
                     currentSky = SkyShaderInfo{};
                     currentSkyParsed = false;
@@ -1614,6 +1672,12 @@ void LoadShaderScripts()
                         definition.alphaTested = preferredAlphaTested;
                         definition.environmentMap = preferredEnvironment;
                         definition.transparentSurface = currentTransparentSurface;
+                        definition.surfaceLight = currentSurfaceLight;
+                        definition.lightImage = currentLightImage;
+                        definition.editorImage = currentEditorImage;
+                        definition.hasLightRGB = currentHasLightRGB;
+                        std::memcpy(definition.lightRGB, currentLightRGB, sizeof(currentLightRGB));
+                        definition.twoSided = currentTwoSided;
                         definition.baseStageIndex = preferredStageIndex;
                         const bool baseStageAnimated = preferredStageIndex < currentStages.size() &&
                             currentStages[preferredStageIndex].animated;
@@ -1683,6 +1747,26 @@ void LoadShaderScripts()
                     }
                     currentSkyParsed = true;
                     index += 3;
+                } else if (_stricmp(token.c_str(), "q3map_surfacelight") == 0 && argsAvailable(index, 1)) {
+                    currentSurfaceLight = std::max(0.0f, static_cast<float>(std::atof(tokens[index + 1].c_str())));
+                    index += 1;
+                } else if (_stricmp(token.c_str(), "q3map_lightimage") == 0 && argsAvailable(index, 1)) {
+                    currentLightImage = tokens[index + 1];
+                    index += 1;
+                } else if (_stricmp(token.c_str(), "qer_editorimage") == 0 && argsAvailable(index, 1)) {
+                    currentEditorImage = tokens[index + 1];
+                    index += 1;
+                } else if (_stricmp(token.c_str(), "q3map_lightRGB") == 0 && argsAvailable(index, 3)) {
+                    currentHasLightRGB = true;
+                    for (int c = 0; c < 3; ++c) {
+                        currentLightRGB[c] = std::max(0.0f, static_cast<float>(std::atof(tokens[index + 1 + c].c_str())));
+                    }
+                    index += 3;
+                } else if (_stricmp(token.c_str(), "cull") == 0 && argsAvailable(index, 1)) {
+                    const char *mode = tokens[index + 1].c_str();
+                    currentTwoSided = _stricmp(mode, "none") == 0 || _stricmp(mode, "disable") == 0 ||
+                        _stricmp(mode, "twosided") == 0;
+                    index += 1;
                 } else if (_stricmp(token.c_str(), "surfaceparm") == 0 && argsAvailable(index, 1)) {
                     if (_stricmp(tokens[index + 1].c_str(), "sky") == 0) {
                         currentSkyFlag = true;
@@ -1860,6 +1944,54 @@ void LoadShaderScripts()
 
 }
 
+// q3map_surfacelight shaders carry the lit part of the fixture either in an additive stage
+// (base_light "*.blend" textures) or in the base texture itself. That mask becomes the
+// material's emission channel so the light surface glows in the traced image.
+bool BuildSurfaceLightEmission(const ShaderDefinition &definition, int width, int height,
+    const std::vector<uint8_t> &albedo, std::vector<uint8_t> &emission)
+{
+    if (definition.surfaceLight <= 0.0f || qraySurfaceLightGlow == nullptr ||
+        qraySurfaceLightGlow->integer == 0 || width <= 0 || height <= 0) {
+        return false;
+    }
+    const size_t pixelCount = static_cast<size_t>(width) * height;
+    emission.assign(pixelCount, 0);
+
+    std::string maskName;
+    for (const ShaderStage &stage : definition.stages) {
+        const bool additive = stage.blend == QR_GEOMETRY_MATERIAL_BLEND_TYPE_ADD ||
+            (stage.blendSrc == QR_BLEND_FACTOR_ONE && stage.blendDst == QR_BLEND_FACTOR_ONE);
+        if (additive && !stage.lightmap && !stage.environmentMap && !stage.map.empty() &&
+            _stricmp(stage.map.c_str(), definition.map.c_str()) != 0) {
+            maskName = stage.map;
+            break;
+        }
+    }
+
+    int maskWidth = 0;
+    int maskHeight = 0;
+    std::vector<uint8_t> mask;
+    if (!maskName.empty() && LoadQ3Texture(maskName.c_str(), maskWidth, maskHeight, mask)) {
+        for (int y = 0; y < height; ++y) {
+            const int my = std::min(maskHeight - 1, y * maskHeight / height);
+            for (int x = 0; x < width; ++x) {
+                const int mx = std::min(maskWidth - 1, x * maskWidth / width);
+                const uint8_t *texel = &mask[(static_cast<size_t>(my) * maskWidth + mx) * 4];
+                emission[static_cast<size_t>(y) * width + x] = std::max({texel[0], texel[1], texel[2]});
+            }
+        }
+        return true;
+    }
+
+    // No separate glow stage: the bright texels of the base texture are the light. The
+    // squared response keeps dark frames and trims from glowing.
+    for (size_t i = 0; i < pixelCount && i * 4 + 2 < albedo.size(); ++i) {
+        const float value = std::max({albedo[i * 4 + 0], albedo[i * 4 + 1], albedo[i * 4 + 2]}) / 255.0f;
+        emission[i] = static_cast<uint8_t>(std::clamp(value * value * 255.0f, 0.0f, 255.0f));
+    }
+    return true;
+}
+
 QrMaterial GetMaterialForTextureNameInternal(const char *name, bool rawTexture)
 {
     if (name == nullptr || name[0] == '\0') {
@@ -1887,8 +2019,15 @@ QrMaterial GetMaterialForTextureNameInternal(const char *name, bool rawTexture)
         if (darkenDecal) {
             ConvertToDarkenDecalTexture(albedo);
         }
-        material = CreateMaterialFromPixels(textureName, width, height, albedo,
-            QR_SAMPLER_ADDRESS_MODE_REPEAT);
+        std::vector<uint8_t> emission;
+        if (!rawTexture && shaderIt != shaderDefinitions.end() &&
+            BuildSurfaceLightEmission(shaderIt->second, width, height, albedo, emission)) {
+            material = CreateMaterialFromPixels(textureName, width, height, albedo,
+                QR_SAMPLER_ADDRESS_MODE_REPEAT, &emission);
+        } else {
+            material = CreateMaterialFromPixels(textureName, width, height, albedo,
+                QR_SAMPLER_ADDRESS_MODE_REPEAT);
+        }
     }
     if (material == QR_NO_MATERIAL) {
         if (hostLogEnabled) {
@@ -2217,6 +2356,7 @@ void ResetMaterialState()
     skyAtlasAttempted = false;
     skyAtlasFaceSize = 0;
     worldClusters.uploaded = false;
+    surfaceEmitters.clear();
     markTriangles.clear();
     markGrid.clear();
     worldSurfaceInfos.clear();
@@ -2482,6 +2622,262 @@ void UploadSunLight()
     }
 }
 
+void EvaluatePatch(const drawVert_t *control, int width, int height,
+    float u, float v, float outPosition[3], float outTexCoord[2]);
+int NearbyBspClusterForPoint(const float point[3], bool *neededNudge);
+
+// Colour of a q3map surface light: q3map_lightRGB, else the average of q3map_lightimage,
+// qer_editorimage or the base map, normalised so the brightest channel is 1 like q3map's
+// ColorNormalize. Returns false when the shader does not emit.
+bool ResolveSurfaceLight(const char *shaderName, float color[3], float &value, bool &twoSided)
+{
+    struct Resolved { bool emits; float color[3]; float value; bool twoSided; };
+    static std::unordered_map<std::string, Resolved> cache;
+    static const void *cachedDefinitions = nullptr;
+    if (cachedDefinitions != static_cast<const void *>(&shaderDefinitions) || cache.size() > 65536) {
+        cache.clear();
+        cachedDefinitions = &shaderDefinitions;
+    }
+
+    const std::string key = NormalizeShaderName(shaderName != nullptr ? shaderName : "");
+    auto existing = cache.find(key);
+    if (existing == cache.end()) {
+        Resolved resolved{false, {1.0f, 1.0f, 1.0f}, 0.0f, false};
+        const auto it = shaderDefinitions.find(key);
+        if (it != shaderDefinitions.end() && it->second.surfaceLight > 0.0f) {
+            const ShaderDefinition &definition = it->second;
+            resolved.emits = true;
+            resolved.value = definition.surfaceLight;
+            resolved.twoSided = definition.twoSided;
+            if (definition.hasLightRGB) {
+                std::memcpy(resolved.color, definition.lightRGB, sizeof(resolved.color));
+            } else {
+                const std::string *sources[] = {&definition.lightImage, &definition.editorImage, &definition.map};
+                for (const std::string *source : sources) {
+                    int width = 0;
+                    int height = 0;
+                    std::vector<uint8_t> pixels;
+                    if (source->empty() || !LoadQ3Texture(source->c_str(), width, height, pixels)) {
+                        continue;
+                    }
+                    double sum[3] = {0.0, 0.0, 0.0};
+                    const size_t count = static_cast<size_t>(width) * height;
+                    for (size_t i = 0; i < count; ++i) {
+                        for (int c = 0; c < 3; ++c) {
+                            sum[c] += pixels[i * 4 + c];
+                        }
+                    }
+                    for (int c = 0; c < 3; ++c) {
+                        resolved.color[c] = static_cast<float>(sum[c] / (255.0 * std::max<size_t>(count, 1)));
+                    }
+                    break;
+                }
+            }
+            const float peak = std::max({resolved.color[0], resolved.color[1], resolved.color[2]});
+            if (peak > 1e-4f) {
+                for (float &channel : resolved.color) {
+                    channel /= peak;
+                }
+            } else {
+                resolved.color[0] = resolved.color[1] = resolved.color[2] = 1.0f;
+            }
+        }
+        existing = cache.emplace(key, resolved).first;
+    }
+
+    if (!existing->second.emits) {
+        return false;
+    }
+    std::memcpy(color, existing->second.color, sizeof(existing->second.color));
+    value = existing->second.value;
+    twoSided = existing->second.twoSided;
+    return true;
+}
+
+// q3map: area light photons = surfacelight * area * areaScale (0.25), point light photons =
+// light * pointScale (7500). Expressing the emitter in point-light units lets it share the
+// qray_lightScale calibration of the map light entities.
+constexpr float kQ3MapAreaToPointScale = 0.25f / 7500.0f;
+
+void AddSurfaceEmitterTriangle(const float a[3], const float b[3], const float c[3],
+    const float desiredNormal[3], const float color[3], float value, bool twoSided)
+{
+    const float e1[3] = {b[0] - a[0], b[1] - a[1], b[2] - a[2]};
+    const float e2[3] = {c[0] - a[0], c[1] - a[1], c[2] - a[2]};
+    float normal[3] = {
+        e1[1] * e2[2] - e1[2] * e2[1],
+        e1[2] * e2[0] - e1[0] * e2[2],
+        e1[0] * e2[1] - e1[1] * e2[0],
+    };
+    const float length = std::sqrt(normal[0] * normal[0] + normal[1] * normal[1] + normal[2] * normal[2]);
+    const float area = 0.5f * length;
+    if (!std::isfinite(area) || area < 1.0f) {
+        return;
+    }
+    for (float &component : normal) {
+        component /= length;
+    }
+
+    SurfaceEmitter emitter{};
+    // The SDK emits from the side of cross(p1 - p0, p2 - p0); orient it along the surface.
+    const bool flip = normal[0] * desiredNormal[0] + normal[1] * desiredNormal[1] + normal[2] * desiredNormal[2] < 0.0f;
+    const float *ordered[3] = {a, flip ? c : b, flip ? b : c};
+    for (int corner = 0; corner < 3; ++corner) {
+        for (int axis = 0; axis < 3; ++axis) {
+            emitter.points[corner][axis] = ordered[corner][axis];
+        }
+    }
+    for (int axis = 0; axis < 3; ++axis) {
+        emitter.normal[axis] = flip ? -normal[axis] : normal[axis];
+        emitter.centroid[axis] = (a[axis] + b[axis] + c[axis]) / 3.0f;
+        emitter.power[axis] = color[axis] * value * area * kQ3MapAreaToPointScale;
+    }
+    emitter.area = area;
+    emitter.cluster = static_cast<uint32_t>(QR_CLUSTER_LIGHT_NO_CLUSTER);
+    surfaceEmitters.push_back(emitter);
+
+    if (twoSided) {
+        SurfaceEmitter back = emitter;
+        std::swap(back.points[1], back.points[2]);
+        for (float &component : back.normal) {
+            component = -component;
+        }
+        surfaceEmitters.push_back(back);
+    }
+}
+
+void CollectSurfaceEmitters(const dsurface_t &surface, const drawVert_t *verts, const int *indices,
+    const char *shaderName)
+{
+    if (qraySurfaceLights == nullptr || qraySurfaceLights->integer == 0) {
+        return;
+    }
+    float color[3] = {1.0f, 1.0f, 1.0f};
+    float value = 0.0f;
+    bool twoSided = false;
+    if (!ResolveSurfaceLight(shaderName, color, value, twoSided)) {
+        return;
+    }
+    const drawVert_t *base = verts + surface.firstVert;
+
+    if (surface.surfaceType == MST_PATCH) {
+        // A coarse grid is enough for light sampling: two segments per control span.
+        constexpr int level = 2;
+        const int columns = (surface.patchWidth - 1) * level + 1;
+        const int rows = (surface.patchHeight - 1) * level + 1;
+        std::vector<float> grid(static_cast<size_t>(columns) * rows * 3);
+        for (int y = 0; y < rows; ++y) {
+            for (int x = 0; x < columns; ++x) {
+                float texCoord[2] = {};
+                EvaluatePatch(base, surface.patchWidth, surface.patchHeight,
+                    static_cast<float>(x) / static_cast<float>(columns - 1),
+                    static_cast<float>(y) / static_cast<float>(rows - 1),
+                    &grid[(static_cast<size_t>(y) * columns + x) * 3], texCoord);
+            }
+        }
+        float desired[3] = {0.0f, 0.0f, 0.0f};
+        for (int i = 0; i < surface.numVerts; ++i) {
+            for (int axis = 0; axis < 3; ++axis) {
+                desired[axis] += base[i].normal[axis];
+            }
+        }
+        NormalizeVector(desired);
+        for (int y = 0; y + 1 < rows; ++y) {
+            for (int x = 0; x + 1 < columns; ++x) {
+                const float *p0 = &grid[(static_cast<size_t>(y) * columns + x) * 3];
+                const float *p1 = p0 + 3;
+                const float *p2 = &grid[(static_cast<size_t>(y + 1) * columns + x) * 3];
+                const float *p3 = p2 + 3;
+                AddSurfaceEmitterTriangle(p0, p1, p2, desired, color, value, twoSided);
+                AddSurfaceEmitterTriangle(p1, p3, p2, desired, color, value, twoSided);
+            }
+        }
+        return;
+    }
+
+    for (int i = 0; i + 2 < surface.numIndexes; i += 3) {
+        const int i0 = indices[surface.firstIndex + i + 0];
+        const int i1 = indices[surface.firstIndex + i + 1];
+        const int i2 = indices[surface.firstIndex + i + 2];
+        if (i0 < 0 || i1 < 0 || i2 < 0 || i0 >= surface.numVerts || i1 >= surface.numVerts ||
+            i2 >= surface.numVerts) {
+            continue;
+        }
+        float desired[3];
+        if (surface.surfaceType == MST_PLANAR) {
+            desired[0] = surface.lightmapVecs[2][0];
+            desired[1] = surface.lightmapVecs[2][1];
+            desired[2] = surface.lightmapVecs[2][2];
+        } else {
+            for (int axis = 0; axis < 3; ++axis) {
+                desired[axis] = base[i0].normal[axis] + base[i1].normal[axis] + base[i2].normal[axis];
+            }
+        }
+        AddSurfaceEmitterTriangle(base[i0].xyz, base[i1].xyz, base[i2].xyz, desired, color, value, twoSided);
+    }
+}
+
+void FinalizeSurfaceEmitters()
+{
+    const size_t collected = surfaceEmitters.size();
+    const int configuredMax = qraySurfaceLightMax != nullptr ? qraySurfaceLightMax->integer : 2048;
+    const size_t maxEmitters = static_cast<size_t>(std::clamp(configuredMax, 0, 3584));
+    if (surfaceEmitters.size() > maxEmitters) {
+        std::sort(surfaceEmitters.begin(), surfaceEmitters.end(),
+            [](const SurfaceEmitter &a, const SurfaceEmitter &b) {
+                return a.power[0] + a.power[1] + a.power[2] > b.power[0] + b.power[1] + b.power[2];
+            });
+        surfaceEmitters.resize(maxEmitters);
+    }
+    size_t resolvedClusters = 0;
+    for (SurfaceEmitter &emitter : surfaceEmitters) {
+        // Probe a little in front of the surface: the face itself lies on a leaf boundary.
+        const float probe[3] = {
+            emitter.centroid[0] + emitter.normal[0] * 4.0f,
+            emitter.centroid[1] + emitter.normal[1] * 4.0f,
+            emitter.centroid[2] + emitter.normal[2] * 4.0f,
+        };
+        const int cluster = NearbyBspClusterForPoint(probe, nullptr);
+        if (cluster >= 1) {
+            emitter.cluster = static_cast<uint32_t>(cluster);
+            ++resolvedClusters;
+        }
+    }
+    HostLog("SurfaceLights: collected=%zu kept=%zu clustered=%zu", collected, surfaceEmitters.size(),
+        resolvedClusters);
+    if (collected > 0) {
+        ri.Printf(PRINT_ALL, "rendererqray: %zu surface light triangles%s\n", surfaceEmitters.size(),
+            collected > surfaceEmitters.size() ? " (dimmest dropped, see qray_surfaceLightMax)" : "");
+    }
+}
+
+void UploadSurfaceLights()
+{
+    if (qrayInstance == QR_NULL_HANDLE || surfaceEmitters.empty()) {
+        return;
+    }
+    const float scale = CvarFloat(qrayLightScale, 200.0f) * CvarFloat(qraySurfaceLightScale, 1.0f);
+    if (scale <= 0.0f) {
+        return;
+    }
+    for (size_t i = 0; i < surfaceEmitters.size(); ++i) {
+        const SurfaceEmitter &emitter = surfaceEmitters[i];
+        QrPolygonalLightUploadInfo light{};
+        light.uniqueID = kSurfaceLightUniqueIdBase + i;
+        for (int c = 0; c < 3; ++c) {
+            light.color.data[c] = emitter.power[c] * scale;
+        }
+        for (int corner = 0; corner < 3; ++corner) {
+            QuakePositionToMeters(emitter.points[corner], light.positions[corner]);
+        }
+        const QrResult result = qrUploadPolygonalLight(qrayInstance, &light);
+        if (result != QR_SUCCESS) {
+            HostLog("UploadSurfaceLights: light %zu failed result=%d", i, static_cast<int>(result));
+            break;
+        }
+    }
+}
+
 void UploadMapLights()
 {
     if (qrayInstance == QR_NULL_HANDLE || mapLights.empty()) {
@@ -2560,6 +2956,7 @@ void UploadSceneLights()
 {
     UploadSunLight();
     UploadMapLights();
+    UploadSurfaceLights();
     UploadDynamicLights();
     const bool globalSampling = GlobalLightSamplingEnabled();
     static int reportedSamplingMode = -1;
@@ -3360,7 +3757,7 @@ void UploadWorldClusters()
 void UploadClusterLightSources()
 {
     if (qrayInstance == QR_NULL_HANDLE || !worldClusters.uploaded ||
-        (mapLights.empty() && dynamicLights.empty())) {
+        (mapLights.empty() && dynamicLights.empty() && surfaceEmitters.empty())) {
         return;
     }
 
@@ -3370,7 +3767,7 @@ void UploadClusterLightSources()
     const float topUpReach = QuakeUnitsToMeters(CvarFloat(qrayLightTopUp, 1024.0f));
 
     static std::vector<QrClusterLightSource> sources;
-    sources.resize(mapLights.size() + dynamicLights.size());
+    sources.resize(mapLights.size() + dynamicLights.size() + surfaceEmitters.size());
 
     for (size_t index = 0; index < mapLights.size(); ++index) {
         const MapLight &light = mapLights[index];
@@ -3402,6 +3799,22 @@ void UploadClusterLightSources()
         source.clusterCount = 0;
         source.pClusters = nullptr;
         source.power = (light.color[0] + light.color[1] + light.color[2]) * dlightScale / 3.0f;
+    }
+
+    const float surfaceScale = lightScale * CvarFloat(qraySurfaceLightScale, 1.0f);
+    const size_t surfaceBase = mapLights.size() + dynamicLights.size();
+    for (size_t index = 0; index < surfaceEmitters.size(); ++index) {
+        const SurfaceEmitter &emitter = surfaceEmitters[index];
+        QrClusterLightSource &source = sources[surfaceBase + index];
+        source = QrClusterLightSource{};
+        source.uniqueID = kSurfaceLightUniqueIdBase + index;
+        QuakePositionToMeters(emitter.centroid, source.origin);
+        source.cluster = emitter.cluster;
+        source.reach = 0.0f;
+        source.radius = QuakeUnitsToMeters(std::max(1.0f, std::sqrt(emitter.area / kPi)));
+        source.clusterCount = 0;
+        source.pClusters = nullptr;
+        source.power = (emitter.power[0] + emitter.power[1] + emitter.power[2]) * surfaceScale / 3.0f;
     }
 
     QrClusterLightSourcesUploadInfo info{};
@@ -4004,6 +4417,7 @@ bool LoadBspGeometryInner(const char *name)
         worldMin[i] = 1.0e30f;
         worldMax[i] = -1.0e30f;
     }
+    surfaceEmitters.clear();
     // Decals must never be projected against the previous map if this load fails.
     markTriangles.clear();
     markGrid.clear();
@@ -4165,6 +4579,7 @@ bool LoadBspGeometryInner(const char *name)
                     surfaceInfo.patchWidth = surface.patchWidth;
                     surfaceInfo.patchHeight = surface.patchHeight;
 
+                    CollectSurfaceEmitters(surface, verts, indices, shader.shader);
                     const QrMaterial material = CreateMaterialForShader(surface.shaderNum, shader.shader);
 
                     if (surface.surfaceType == MST_PATCH) {
@@ -4512,6 +4927,7 @@ bool LoadBspGeometryInner(const char *name)
                         HostLog("LoadBspGeometry: batch %zu upload failed result=%d", batchIndex, static_cast<int>(uploadResult));
                     }
                 }
+                FinalizeSurfaceEmitters();
                 staticGuard.open = false;
                 const QrResult submitResult = qrSubmitStaticGeometries(qrayInstance);
                 HostLog("LoadBspGeometry: qrSubmitStaticGeometries result=%d alphaTestedBatches=%d "
@@ -5861,11 +6277,22 @@ void DrawFrame()
     }
 
     QrDrawFrameRenderResolutionParams resolution{};
-    resolution.upscaleTechnique = QR_RENDER_UPSCALE_TECHNIQUE_LINEAR;
+    const int upscale = qrayUpscale != nullptr ? std::clamp(qrayUpscale->integer, 0, 4) : 1;
+    static const QrRenderResolutionMode kFsrModes[] = {
+        QR_RENDER_RESOLUTION_MODE_NATIVE_AA, QR_RENDER_RESOLUTION_MODE_NATIVE_AA,
+        QR_RENDER_RESOLUTION_MODE_QUALITY, QR_RENDER_RESOLUTION_MODE_BALANCED,
+        QR_RENDER_RESOLUTION_MODE_PERFORMANCE,
+    };
     resolution.sharpenTechnique = QR_RENDER_SHARPEN_TECHNIQUE_NONE;
-    resolution.resolutionMode = QR_RENDER_RESOLUTION_MODE_CUSTOM;
-    resolution.customRenderSize.width = static_cast<uint32_t>(std::max(1, glConfig.vidWidth));
-    resolution.customRenderSize.height = static_cast<uint32_t>(std::max(1, glConfig.vidHeight));
+    if (upscale == 0) {
+        resolution.upscaleTechnique = QR_RENDER_UPSCALE_TECHNIQUE_LINEAR;
+        resolution.resolutionMode = QR_RENDER_RESOLUTION_MODE_CUSTOM;
+        resolution.customRenderSize.width = static_cast<uint32_t>(std::max(1, glConfig.vidWidth));
+        resolution.customRenderSize.height = static_cast<uint32_t>(std::max(1, glConfig.vidHeight));
+    } else {
+        resolution.upscaleTechnique = QR_RENDER_UPSCALE_TECHNIQUE_AMD_FSR3;
+        resolution.resolutionMode = kFsrModes[upscale];
+    }
 
     const float giLevel = std::clamp(CvarFloat(qrayGiLevel, 1.0f), 0.0f, 2.0f);
     QrDrawFrameIlluminationParams illumination{};

@@ -87,6 +87,14 @@ ENDIF()
 
 # client + cURL
 AUX_SOURCE_DIRECTORY(code/client CLIENT_SRCS)
+IF(UNIX AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
+	# snd_mix.c calls the SSE mixer from this GNU assembler file on x86_64 (see Makefile).
+	enable_language(ASM)
+	list(APPEND CLIENT_SRCS code/asm/snd_mix_x86_64.s)
+	# The file uses qasm.h macros, so it has to go through the C preprocessor.
+	set_source_files_properties(code/asm/snd_mix_x86_64.s PROPERTIES
+		LANGUAGE C COMPILE_OPTIONS "-x;assembler-with-cpp" COMPILE_DEFINITIONS ELF)
+ENDIF()
 IF(NOT USE_CURL)
 	list(REMOVE_ITEM CLIENT_SRCS code/client/cl_curl.c)
 ENDIF()
