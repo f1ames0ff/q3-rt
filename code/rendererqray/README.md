@@ -1,7 +1,8 @@
 # rendererqray
 
 `rendererqray` is the Quake 3 sidecar renderer that hosts the QuakeRay SDK. It is a
-separate Windows DLL (`quake3e_qray_x86_64.dll`) loaded through `cl_renderer qray`.
+separate shared library (`quake3e_qray_x86_64.dll` on Windows,
+`quake3e_qray_x86_64.so` on Linux) loaded through `cl_renderer qray`.
 The QuakeRay SDK continues to own the Vulkan instance, device, surface, swapchain
 and presentation path; Quake 3 only supplies the native window handle.
 
@@ -9,7 +10,8 @@ and presentation path; Quake 3 only supplies the native window handle.
 
 This tree implements the first integration stage:
 
-- `GetWindowHandle` in `refimport_t` and Win32 window export from `win_glimp.c`.
+- `GetWindowHandle` / `GetNativeWindow` in `refimport_t` with Win32 (`win_glimp.c`)
+  and Linux X11 (`sdl_glimp.c` / `linux_glimp.c`) window export.
 - Correct qray instance lifetime across `REF_KEEP_CONTEXT`, `REF_KEEP_WINDOW` and
   window destruction.
 - World geometry upload for Quake 3 BSP planar, triangle-soup and Bezier patch
@@ -17,19 +19,20 @@ This tree implements the first integration stage:
 - Direct Q3 texture loading into qray materials, with `.jpg`/`.png` fallback
   for model assets that reference a missing `.tga`, plus Q3 `.shader` script
   parsing for world, model and item materials.
-- Shader stages drive the qray blend state: `blendFunc` factor pairs and
-  mnemonics map onto `QrBlendFactor`, so additive effects, alpha blending and
-  the `GL_ZERO`/`GL_ONE_MINUS_SRC_COLOR` darken blend used by impact marks all
-  keep their authored behaviour. Darken-blend decals are converted into a black
-  texture whose alpha carries the source luminance, because a layer with alpha in
-  slot 0 is treated as opaque by the qray compositor.
+- Shader stages drive the qray blend state and rasterized world overlays: `blendFunc`
+  factor pairs and mnemonics (`add`, `blend`, `filter`) map onto `QrBlendFactor`, so
+  additive effects, alpha blending, `filter` decals and darkened impact marks keep their
+  authored behaviour; multi-stage or animated world shaders (`animMap`, `clampmap`,
+  `tcMod scale`/`scroll`/`rotate`/`stretch`/`turb`, and `rgbGen`/`alphaGen` waves such as
+  torches, jump pads and scrolling surfaces) composite in the raster overlay pass with
+  HDR luminance scaling (`qray_overlayScale`, `qray_overlayAddScale`).
 - `alphaFunc` stages upload their surfaces into the qray alpha-tested hit group,
   so grate and fence cut-outs are seen through by camera, shadow and reflection
   rays instead of rendering as solid quads.
-- Configurable directional sun and Quake 3 `light` entity upload as spherical
-  lights, additionally aggregated into per-cluster light lists from the BSP
-  cluster tree and PVS so direct lighting only samples the lights that can reach
-  the hit point.
+- Configurable directional sun, Quake 3 `light` entities, and `q3map_surfacelight`
+  surface emitters (aggregated per surface into spherical/polygonal cluster lights
+  with optional self-lit emission masks) integrated into per-cluster light lists from
+  the BSP cluster tree and PVS.
 - QuakeRaySDK 0.2.0 spatial contract: Q3 keeps its native units internally and
   converts positions, radii, reaches, cluster bounds and camera distances to
   meters at the `qr*` API boundary.
@@ -42,12 +45,13 @@ This tree implements the first integration stage:
   lightning.
 - Rasterized 2D overlay for Q3 UI/HUD assets and a bigchars-based fallback font.
 - Asynchronous final-frame readback and RGB24 conversion for Quake 3 AVI capture.
+- FidelityFX FSR 3.1 upscaling / native AA selection (`qray_upscale`) and procedural
+  physical sky with volumetric clouds (`qray_physicalSky`).
 - Full `refexport_t` wiring, with explicit no-op stubs for features that are not
   implemented yet.
 
 Not implemented yet: IQM/MDR models, BSP inline models (bmodels), mirrors and
-portals, `surfaceparm trans` blend stages on world geometry, lightmaps/DTAL
-relighting, authored PBR overrides, FSR/DLSS selection and automatic fallback.
+portals, lightmaps/DTAL relighting, authored PBR overrides, and DLSS selection.
 Those are follow-up stages.
 
 ## Build
@@ -138,10 +142,13 @@ shipped in a game directory or referenced from a development checkout:
 - `qray_blueNoise`: blue-noise PNG used by QuakeRay.
 - `qray_waterNormal`: optional water normal PNG.
 - `qray_config`: optional QuakeRay settings file.
-- `qray_sunColor`: directional sun RGB, default `1.0 0.95 0.85`.
-- `qray_sunIntensity`: directional sun intensity, default `3.0`.
-- `qray_lightScale`: radiometric scale applied to Quake 3 map light entities,
-  default `200`.
+- `qray_sunColor`: directional sun RGB, default empty (uses the map's `q3map_sun`).
+- `qray_physicalSkyPower`: physical sun intensity from `0` to `100`, default `2.5`
+  (replacing older `qray_sunIntensity`).
+- `qray_lightScale`: radiometric scale applied to Quake 3 map light entities and
+  surface emitters, default `0.25`.
+- `qray_dlightScale`: intensity scale applied to per-frame dynamic lights,
+  default `0.25`.
 - `qray_lightRadius`: emission sphere radius of a Quake 3 map light in Quake
   units, default `16`. Small values behave like point lights.
 - `qray_lightTopUp`: distance in Quake units within which a cluster also
@@ -199,19 +206,26 @@ reference temporal sensitivities, a 2 m GI cell, and the denoiser enabled.
 
 | Cvar | Default | Description |
 | --- | --- | --- |
+| `qray_upscale` | `1` | Upscaler: `0` = linear (custom render size), `1` = FSR 3.1 native AA, `2` = FSR quality, `3` = FSR balanced, `4` = FSR performance. |
 | `qray_giLevel` | `1` | `0` disables GI, `1` enables one bounce, `2` enables the second bounce. |
 | `qray_denoiser` | `1` | Enable the QuakeRay temporal denoiser. |
 | `qray_neeSamples` | `2` | Direct-light samples, clamped to 1 or 2. |
-| `qray_restir` | `1` | ReSTIR over the global light list; cluster light sources are not uploaded while it is on. |
-| `qray_restirCandidates` | `8` | ReSTIR candidates per light sample. |
+| `qray_restir` | `0` | ReSTIR over the global light list (`1`) vs per-cluster light sampling (`0`, default so ASVGF gradient estimation remains active). |
+| `qray_restirCandidates` | `32` | ReSTIR candidates per light sample (`1`..`64`). |
 | `qray_cellWorldSize` | `2.0` | GI/ReSTIR spatial cell size in metres. |
 | `qray_sunBounceRange` | `50.8` | Sun reach into an indirect bounce in metres. |
 | `qray_indirectHalfRes` | `1` | Full-resolution primary rays, half-resolution indirect rays. |
+| `qray_surfaceLights` | `1` | Collect `q3map_surfacelight` shaders (torches, light fixtures, lava) as area/spherical emitters (applied on map load). |
+| `qray_surfaceLightScale` | `0.4` | Multiplier applied to `q3map_surfacelight` emitters on top of `qray_lightScale`. |
+| `qray_surfaceLightMax` | `2048` | Maximum surface emitter entries per map; dimmest emitters are dropped above it. |
+| `qray_surfaceLightGlow` | `1` | Write emission masks into `q3map_surfacelight` materials; composited additively (`emissionBlendMode = 2`). |
 
-All Q3 dynamic-light callbacks (`AddLightToScene`, additive and linear forms)
-are collected per frame and uploaded as spherical cluster light sources. Linear
-lights use a midpoint/radius proxy. `qray_dlightScale` controls their relative
-intensity.
+Compact `q3map_surfacelight` fixtures and `MST_TRIANGLE_SOUP` flames (e.g. torches) are
+collapsed per surface into a single spherical emitter (rather than dozens of micro-triangles),
+while larger emitting surfaces keep up to 8 largest polygonal triangles with conserved power.
+All Q3 dynamic-light callbacks (`AddLightToScene`, additive and linear forms) are collected
+per frame and uploaded as spherical cluster light sources; `qray_dlightScale` (`0.25`) scales
+their intensity.
 
 ## Lifetime contract
 
@@ -262,25 +276,26 @@ Retail Quake 3 bakes the `q3map_sun` directive of the sky shader into the lightm
 renderer has to place the sun itself. The sidecar now parses `q3map_sun` / `q3map_sunExt`
 (`<r> <g> <b> <intensity> <degrees> <elevation>`) from the sky shader of the loaded map and
 drives the directional light with it. `intensity` is normalized against the value retail maps
-use most (80) and scaled by `qray_sunIntensity`; `qray_sunColor` still overrides the color and
-must be empty (the default) to keep the map values.
+use most (80) and scaled by `qray_physicalSkyPower` (default `2.5`); `qray_sunColor` still
+overrides the color and must be empty (the default) to keep the map values.
 
 The retail sky textures carry no sun disc, because the sun only ever existed in the lightmaps.
 The sidecar therefore burns one into the sky atlas: a saturated core of about one degree with a
 seven degree glow, placed on the direction taken from the same `q3map_sun` that feeds the
 directional light, so light and disc can not drift apart. Skies without `q3map_sun` get no disc.
 
-By default the renderer uses QuakeRay's procedural sky instead of that atlas:
+By default the renderer uses QuakeRay's procedural sky instead of that atlas (`qray_skybox 0`):
 
 - `qray_physicalSky 1` selects `QR_SKY_TYPE_PROCEDURAL`.
 - `qray_physicalSkySun 1` uploads the map sun as the directional light and visible disc.
 - `qray_clouds 1` enables the volumetric cloud layer.
 - `qray_godRays 1` enables procedural sun shafts.
 - `qray_skyColor`, `qray_cloudColor`, cloud coverage/density/speed/height/thickness,
-  cloud opacity/quality and god-ray intensity/quality are exposed as `qray_*` cvars.
+  cloud opacity/quality and god-ray intensity/quality are exposed as `qray_*` cvars. With
+  `qray_skyColor "auto"`, black space skies fall back to QuakeRay's blue sky profile.
 - `qray_physicalSkySunPitch` and `qray_physicalSkyYaw` override the map sun direction;
   `-1000` keeps the `q3map_sun` values. `qray_physicalSkyPower` controls sun power
-  from `0` to `100`.
+  from `0` to `100` (default `2.5`).
 - `qray_skyAmbientLod` and `qray_skyLightMultiplier` control how physical sky
   contributes to scene lighting independently of the visible sky.
 
@@ -294,7 +309,7 @@ touching the SDK.
 
 | Cvar | Default | Description |
 | --- | --- | --- |
-| `qray_skybox` | `1` | Draw the map sky as rasterized geometry. |
+| `qray_skybox` | `0` | Draw the map's original sky as rasterized geometry instead of the physical sky (only used with `qray_physicalSky 0`). |
 | `qray_skyboxRadius` | `2000` | Distance of the sky box in map units, must stay inside the far plane. |
 
 ## Model environment stages
@@ -341,10 +356,23 @@ point of one.
 | --- | --- | --- |
 | `qray_tonemapType` | `4` | Operator: `0` none, `1` Reinhard, `2` extended Reinhard, `3` ACES, `4` AgX. |
 | `qray_tonemapPower` | `0.9` | Blend towards the operator; `0` keeps the filmic curve alone. |
-| `qray_whitePoint` | `10.0` | Luminance mapped to white, higher values keep more highlights. |
-| `qray_exposureBias` | `-2.5` | Exposure bias in stops; `-2.5` matches the baked Quake 3 brightness. |
+| `qray_whitePoint` | `20.0` | Luminance mapped to white, higher values keep more highlights. |
+| `qray_exposureBias` | `0` | Exposure bias in stops applied by QuakeRay. |
 | `qray_eyeAdaptation` | `0` | Let QuakeRay adapt exposure to the frame. Retail had a fixed exposure, and adaptation also makes measurements drift between frames, so it is off by default. |
+| `qray_overlayScale` | `2.0` | HDR luminance multiplier for opaque and alpha-blended world shader overlays. |
+| `qray_overlayAddScale` | `24.0` | HDR luminance multiplier for additive and emissive world shader overlays (torches, jump pads, lava). |
 
+## Animated world overlays and surface lights
+
+World surfaces whose `.shader` script contains blended, `clampmap`, `animMap`, `tcMod`
+(`scale`, `scroll`, `rotate`, `stretch`, `turb`) or `rgbGen`/`alphaGen` wave stages are
+rendered through QuakeRay's rasterized world overlay pass (on top of any opaque traced base
+stage, pushed slightly along the surface normal via `qray_decalOffset` when `tracedBase`
+is true). Filter/darken multiplicative stages keep unit color scaling, while opaque, alpha
+and additive/emissive stages scale RGB by `qray_overlayScale` / `qray_overlayAddScale` to
+match QuakeRay's linear HDR lighting. Traced `q3map_surfacelight` fixtures resolve their
+color from `q3map_lightRGB`, `q3map_lightimage` or `qer_editorimage` and composite their
+emission masks additively (`emissionBlendMode = 2`, `emissionMaxScreenColor = 1.5`).
 
 ## Effect blending
 
