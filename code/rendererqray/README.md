@@ -54,41 +54,77 @@ Those are follow-up stages.
 
 Requirements:
 
-- Windows x64 and Visual Studio 2022 (MSVC).
-- Vulkan SDK 1.4.318 or newer.
+- Windows x64 with Visual Studio 2022 (MSVC), or Linux x86_64 with GCC 13+ or
+  Clang 17+ and an X11 session (XWayland works; native Wayland is not supported by
+  the SDK yet).
+- CMake 3.23 or newer (the FidelityFX provider source build needs it).
+- Vulkan SDK / headers 1.4.318 or newer.
 - NVRHI source tree at the SDK-compatible pin with `c_MaxBindingLayouts >= 13`.
-- QuakeRaySDK submodule at `code/quakeraysdk` (`0.2.0`, C ABI `1.06.0000`).
-  Its FidelityFX SDK dependency is present at
-  `code/quakeraysdk/Source/FidelityFX_SDK_1.1.4`.
+- QuakeRaySDK submodule at `code/quakeraysdk` (`0.2.0+`, C ABI `1.06.0000`).
+  FidelityFX 1.1.4 is vendored at `code/quakeraysdk/Source/FidelityFX_SDK_1.1.4`
+  and its Vulkan provider is built from source; no prebuilt binary is linked.
 
-Initialize the submodule from the repository root, then configure and build:
+Initialize the submodule from the repository root:
 
-```powershell
-# From the repository root:
+```sh
 git submodule update --init --recursive
+```
 
-cd code/rendererqray
-cmake -S . -B build -G "Visual Studio 17 2022" -A x64 `
-  -DQR_NVRHI_SOURCE_DIR="C:/path/to/nvrhi"
-cmake --build build --config Debug --target rendererqray
+If NVRHI is at the SDK-compatible upstream pin but still has the stock binding
+layout limit, apply:
+
+```sh
+git -C /path/to/nvrhi apply /path/to/q3-rt/code/quakeraysdk/cmake/nvrhi-max-binding-layouts.patch
 ```
 
 `QUAKERAY_SDK_DIR` defaults to `code/quakeraysdk` and only needs to be set when
 building against an external SDK checkout.
 
-If NVRHI is at the SDK-compatible upstream pin but still has the stock binding
-layout limit, apply:
+### Windows
+
+Build the FidelityFX provider with
+`code/quakeraysdk/Source/FidelityFX_SDK_1.1.4/windows/build_provider.ps1`, then:
 
 ```powershell
-git -C C:/path/to/nvrhi apply C:/path/to/q3-rt/code/quakeraysdk/cmake/nvrhi-max-binding-layouts.patch
+cd code/rendererqray
+cmake -S . -B build -G "Visual Studio 17 2022" -A x64 `
+  -DQR_NVRHI_SOURCE_DIR="C:/path/to/nvrhi" `
+  -DQR_FFX_VK_LIBRARY="C:/path/to/ffx/amd_fidelityfx_vk.lib" `
+  -DQR_FFX_VK_RUNTIME_DLL="C:/path/to/ffx/amd_fidelityfx_vk.dll"
+cmake --build build --config Debug --target rendererqray
 ```
 
-`QR_FFX_SDK_ROOT` can be passed explicitly if the SDK uses a different
-FidelityFX location. The post-build step copies `amd_fidelityfx_vk.dll` next to
-the renderer DLL.
+The post-build step copies `amd_fidelityfx_vk.dll` next to
+`build/Debug/quake3e_qray_x86_64.dll`. Copy both next to the Quake 3 client.
 
-The renderer DLL is built at `build/Debug/quake3e_qray_x86_64.dll`. Copy it,
-`amd_fidelityfx_vk.dll`, and the Quake 3 client into the same directory.
+### Linux
+
+```sh
+cd code/rendererqray
+QR_NVRHI_SOURCE_DIR=/path/to/nvrhi ./build_linux.sh           # Release
+QR_NVRHI_SOURCE_DIR=/path/to/nvrhi ./build_linux.sh Debug
+```
+
+The script builds `libamd_fidelityfx_vk.so` (needs `glslangValidator`), then the
+renderer. The output is `build/linux-<config>/quake3e_qray_x86_64.so` with
+`libamd_fidelityfx_vk.so` beside it; the module's `RUNPATH` is `$ORIGIN`, so copy
+both next to `quake3e.x86_64`. The same module can also be built together with the
+engine with `-DUSE_RENDERER_QRAY=ON -DQR_NVRHI_SOURCE_DIR=...` on the top-level
+CMake project.
+
+The client hands the renderer an X11 `Display*`/`Window` through
+`refimport_t::GetNativeWindow` (SDL2 or the native `linux_glimp.c` backend). Under
+a Wayland session run the client with `SDL_VIDEODRIVER=x11`.
+
+Diagnostic logs (`qray_host.log`, `qray_probe.log`) go to `%TEMP%` on Windows and
+to `$TMPDIR` (default `/tmp`) on Linux.
+
+### Shaders
+
+The SPIR-V shaders that `qray_shaderDir` points at are compiled outside this tree
+(QuakeRay's `build_shaders` step) and are platform independent. They must be
+rebuilt whenever the SDK submodule moves: `Source/Shaders` changes between SDK
+revisions, and mixing old shaders with a newer SDK is undefined.
 
 ## Runtime assets
 
@@ -166,7 +202,7 @@ reference temporal sensitivities, a 2 m GI cell, and the denoiser enabled.
 | `qray_giLevel` | `1` | `0` disables GI, `1` enables one bounce, `2` enables the second bounce. |
 | `qray_denoiser` | `1` | Enable the QuakeRay temporal denoiser. |
 | `qray_neeSamples` | `2` | Direct-light samples, clamped to 1 or 2. |
-| `qray_restir` | `0` | Use global ReSTIR selection instead of cluster lists. |
+| `qray_restir` | `1` | ReSTIR over the global light list; cluster light sources are not uploaded while it is on. |
 | `qray_restirCandidates` | `8` | ReSTIR candidates per light sample. |
 | `qray_cellWorldSize` | `2.0` | GI/ReSTIR spatial cell size in metres. |
 | `qray_sunBounceRange` | `50.8` | Sun reach into an indirect bounce in metres. |
@@ -205,7 +241,7 @@ apart from timing and HUD animation.
 ## World texture probe
 
 `qray_probe` casts a ray through the centre of the current world view and appends
-the hit surface to `%TEMP%\qray_probe.log` on every invocation. It reports the
+the hit surface to `qray_probe.log` in the temp directory on every invocation. It reports the
 BSP shader and resolved texture, flags, surface type, UV, cluster, material,
 windings and the authored/generated normals. A nearer back-facing triangle is
 also recorded separately as `QRAY_PROBE_BACKFACE`, because QuakeRay culls it from

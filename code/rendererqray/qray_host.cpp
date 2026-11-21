@@ -1,4 +1,11 @@
+#ifdef _WIN32
 #include <windows.h>
+#else
+#include <strings.h>
+#include <sys/time.h>
+#include <time.h>
+#include <unistd.h>
+#endif
 
 #include <algorithm>
 #include <cctype>
@@ -28,6 +35,13 @@ extern "C" {
 #include "stb_image.h"
 
 refimport_t ri;
+
+#ifndef _WIN32
+// The shader-script and asset code compares Quake 3 names case-insensitively the
+// way the original MSVC build did.
+static inline int _stricmp(const char *a, const char *b) { return strcasecmp(a, b); }
+static inline int _strnicmp(const char *a, const char *b, size_t n) { return strncasecmp(a, b, n); }
+#endif
 
 namespace {
 
@@ -379,6 +393,9 @@ std::unordered_map<std::string, qhandle_t> modelHandles;
 std::unordered_map<std::string, QrMaterial> textureMaterials;
 std::unordered_map<std::string, QrMaterial> textureMaterialsRaw;
 std::unordered_map<qhandle_t, QrMaterial> uiMaterialsRaw;
+std::unordered_map<std::string, QrMaterial> scaledEnvMaterials;
+// The native window outlives the QuakeRay instance across REF_KEEP_WINDOW restarts.
+bool windowInitialized = false;
 std::unordered_map<std::string, bool> textureHasAlpha;
 std::unordered_map<std::string, ShaderDefinition> shaderDefinitions;
 std::unordered_map<std::string, SkyShaderInfo> skyShaders;
@@ -398,6 +415,7 @@ float skyAverageColor[3] = {0.20f, 0.25f, 0.35f};
 // QuakeRay only samples the cubemap its own sky pass rasterizes, so the sky of the map is also
 // composed into a flat atlas here and drawn as six inward facing quads by the overlay pass.
 QrMaterial skyAtlasMaterial = QR_NO_MATERIAL;
+int skyAtlasFaceSize = 0;
 bool skyAtlasAttempted = false;
 std::unordered_map<qhandle_t, SkinAsset> skinAssets;
 std::unordered_map<std::string, qhandle_t> skinHandles;
@@ -460,6 +478,10 @@ uint64_t readbackBufferSize = 0;
 uint64_t readbackRequest = 0;
 bool readbackPending = false;
 bool readbackValid = false;
+// Full-frame readbacks cost a GPU copy plus a CPU copy every frame, so they only run
+// while a consumer (AVI capture, qray_readback) asked for one recently.
+constexpr int kReadbackKeepAliveFrames = 120;
+int readbackWantedFrames = 0;
 
 bool capturePending = false;
 int captureWidth = 0;
@@ -478,18 +500,46 @@ bool RayIntersectsTriangle(const MarkTriangle &triangle, const float origin[3],
     const float direction[3], float maxDistance, float &hitDistance,
     float *outU, float *outV);
 
+// Directory for the diagnostic logs: %TEMP% on Windows, $TMPDIR or /tmp elsewhere.
+bool TempFilePath(const char *fileName, char *out, size_t outSize)
+{
+    if (out == nullptr || outSize == 0) {
+        return false;
+    }
+    out[0] = '\0';
+#ifdef _WIN32
+    char directory[MAX_PATH] = {};
+    const DWORD length = GetTempPathA(MAX_PATH, directory);
+    if (length == 0 || length >= MAX_PATH) {
+        return false;
+    }
+    const int written = std::snprintf(out, outSize, "%s%s", directory, fileName);
+#else
+    const char *directory = std::getenv("TMPDIR");
+    if (directory == nullptr || directory[0] == '\0') {
+        directory = "/tmp";
+    }
+    const size_t directoryLength = std::strlen(directory);
+    const bool needsSeparator = directoryLength > 0 && directory[directoryLength - 1] != '/';
+    const int written = std::snprintf(out, outSize, "%s%s%s", directory, needsSeparator ? "/" : "", fileName);
+#endif
+    if (written <= 0 || static_cast<size_t>(written) >= outSize) {
+        out[0] = '\0';
+        return false;
+    }
+    return true;
+}
+
 void HostLog(const char *format, ...)
 {
     if (!hostLogEnabled) {
         return;
     }
 
-    char path[MAX_PATH] = {};
-    DWORD length = GetTempPathA(MAX_PATH, path);
-    if (length == 0 || length + 16 >= MAX_PATH) {
+    static char path[1024] = {};
+    if (path[0] == '\0' && !TempFilePath("qray_host.log", path, sizeof(path))) {
         return;
     }
-    std::strcat(path, "qray_host.log");
 
     std::ofstream stream(path, std::ios::app);
     if (!stream.is_open()) {
@@ -507,17 +557,10 @@ void HostLog(const char *format, ...)
 
 const char *ProbeLogPath()
 {
-    static char path[MAX_PATH] = {};
-    if (path[0] != '\0') {
-        return path;
+    static char path[1024] = {};
+    if (path[0] == '\0') {
+        TempFilePath("qray_probe.log", path, sizeof(path));
     }
-
-    DWORD length = GetTempPathA(MAX_PATH, path);
-    if (length == 0 || length + 16 >= MAX_PATH) {
-        path[0] = '\0';
-        return path;
-    }
-    std::strcat(path, "qray_probe.log");
     return path;
 }
 
@@ -539,11 +582,22 @@ void ProbeLog(const char *format, ...)
     std::vsnprintf(message, sizeof(message), format, args);
     va_end(args);
 
+    char timestamp[64] = {};
+#ifdef _WIN32
     SYSTEMTIME now{};
     GetLocalTime(&now);
-    char timestamp[64] = {};
     std::snprintf(timestamp, sizeof(timestamp), "%04u-%02u-%02uT%02u:%02u:%02u.%03u",
         now.wYear, now.wMonth, now.wDay, now.wHour, now.wMinute, now.wSecond, now.wMilliseconds);
+#else
+    struct timeval now {};
+    gettimeofday(&now, nullptr);
+    struct tm local {};
+    const time_t seconds = now.tv_sec;
+    localtime_r(&seconds, &local);
+    std::snprintf(timestamp, sizeof(timestamp), "%04d-%02d-%02dT%02d:%02d:%02d.%03d",
+        local.tm_year + 1900, local.tm_mon + 1, local.tm_mday, local.tm_hour, local.tm_min,
+        local.tm_sec, static_cast<int>(now.tv_usec / 1000));
+#endif
     stream << timestamp << " " << message << "\n";
 }
 
@@ -563,6 +617,7 @@ const char *SurfaceTypeName(int surfaceType)
     }
 }
 
+#ifdef _WIN32
 int HostExceptionFilter(EXCEPTION_POINTERS *exceptionInfo)
 {
     if (exceptionInfo != nullptr && exceptionInfo->ExceptionRecord != nullptr) {
@@ -580,6 +635,14 @@ QrResult CreateInstanceProtected(const QrInstanceCreateInfo *info, QrInstance *i
         return QR_GRAPHICS_API_ERROR;
     }
 }
+#else
+// There is no structured exception handling outside MSVC; C++ exceptions are still
+// caught by the caller.
+QrResult CreateInstanceProtected(const QrInstanceCreateInfo *info, QrInstance *instance)
+{
+    return qrCreateInstance(info, instance);
+}
+#endif
 
 const char *CvarText(cvar_t *cvar, const char *fallback)
 {
@@ -1320,7 +1383,41 @@ void LoadShaderScripts()
         "scripts/test.shader"
     };
 
-    for (const char *scriptName : scriptNames) {
+    // Retail scripts first, in their established order, then every other scripts/*.shader
+    // from the search path (custom maps, mods). Additional scripts only add definitions so
+    // they cannot change how retail content resolves.
+    std::vector<std::string> scriptList(std::begin(scriptNames), std::end(scriptNames));
+    const size_t retailScriptCount = scriptList.size();
+    {
+        std::unordered_set<std::string> known;
+        for (const std::string &name : scriptList) {
+            std::string lower = name;
+            std::transform(lower.begin(), lower.end(), lower.begin(),
+                [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            known.insert(lower);
+        }
+        int listed = 0;
+        char **files = ri.FS_ListFiles != nullptr ? ri.FS_ListFiles("scripts", ".shader", &listed) : nullptr;
+        for (int i = 0; files != nullptr && i < listed; ++i) {
+            if (files[i] == nullptr || files[i][0] == '\0') {
+                continue;
+            }
+            std::string path = std::string("scripts/") + files[i];
+            std::string lower = path;
+            std::transform(lower.begin(), lower.end(), lower.begin(),
+                [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            if (known.insert(lower).second) {
+                scriptList.push_back(std::move(path));
+            }
+        }
+        if (files != nullptr && ri.FS_FreeFileList != nullptr) {
+            ri.FS_FreeFileList(files);
+        }
+    }
+
+    for (size_t scriptIndex = 0; scriptIndex < scriptList.size(); ++scriptIndex) {
+        const char *scriptName = scriptList[scriptIndex].c_str();
+        const bool overrideExisting = scriptIndex < retailScriptCount;
         void *fileData = nullptr;
         const int fileLength = ri.FS_ReadFile(scriptName, &fileData);
         if (fileLength <= 0 || fileData == nullptr) {
@@ -1391,6 +1488,17 @@ void LoadShaderScripts()
         bool currentSkyFlag = false;
         float stageScale[2] = {1.0f, 1.0f};
         int depth = 0;
+        // Arguments never extend past a brace. Q3 parses shader keywords per line; this
+        // token stream has no line breaks, so a short or malformed line must not consume
+        // the closing '}' and desynchronise every later definition in the file.
+        const auto argsAvailable = [&tokens](size_t at, size_t count) {
+            for (size_t k = 1; k <= count; ++k) {
+                if (at + k >= tokens.size() || tokens[at + k] == "{" || tokens[at + k] == "}") {
+                    return false;
+                }
+            }
+            return true;
+        };
         for (size_t index = 0; index < tokens.size(); ++index) {
             const std::string &token = tokens[index];
             if (token == "{") {
@@ -1526,7 +1634,11 @@ void LoadShaderScripts()
                         if (!definition.tracedBase) {
                             definition.usesOverlay = true;
                         }
-                        shaderDefinitions[NormalizeShaderName(currentName)] = std::move(definition);
+                        if (overrideExisting) {
+                            shaderDefinitions[NormalizeShaderName(currentName)] = std::move(definition);
+                        } else {
+                            shaderDefinitions.emplace(NormalizeShaderName(currentName), std::move(definition));
+                        }
                     }
                     if (!currentName.empty() && currentSkyParsed) {
                         skyShaders[NormalizeShaderName(currentName)] = currentSky;
@@ -1551,7 +1663,7 @@ void LoadShaderScripts()
             if (depth == 1) {
                 // q3map_sun <r> <g> <b> <intensity> <degrees> <elevation>; q3map_sunExt appends
                 // deviance and sample count after the same six arguments.
-                if (_strnicmp(token.c_str(), "q3map_sun", 9) == 0 && index + 6 < tokens.size()) {
+                if (_strnicmp(token.c_str(), "q3map_sun", 9) == 0 && argsAvailable(index, 6)) {
                     currentSky.hasSun = true;
                     currentSky.sunColor[0] = static_cast<float>(std::atof(tokens[index + 1].c_str()));
                     currentSky.sunColor[1] = static_cast<float>(std::atof(tokens[index + 2].c_str()));
@@ -1560,7 +1672,7 @@ void LoadShaderScripts()
                     currentSky.sunDegrees = static_cast<float>(std::atof(tokens[index + 5].c_str()));
                     currentSky.sunElevation = static_cast<float>(std::atof(tokens[index + 6].c_str()));
                     index += 6;
-                } else if (_stricmp(token.c_str(), "skyparms") == 0 && index + 3 < tokens.size()) {
+                } else if (_stricmp(token.c_str(), "skyparms") == 0 && argsAvailable(index, 3)) {
                     if (tokens[index + 1] != "-") {
                         currentSky.outerBox = tokens[index + 1];
                     }
@@ -1571,7 +1683,7 @@ void LoadShaderScripts()
                     }
                     currentSkyParsed = true;
                     index += 3;
-                } else if (_stricmp(token.c_str(), "surfaceparm") == 0 && index + 1 < tokens.size()) {
+                } else if (_stricmp(token.c_str(), "surfaceparm") == 0 && argsAvailable(index, 1)) {
                     if (_stricmp(tokens[index + 1].c_str(), "sky") == 0) {
                         currentSkyFlag = true;
                     } else if (_stricmp(tokens[index + 1].c_str(), "trans") == 0) {
@@ -1582,16 +1694,16 @@ void LoadShaderScripts()
                 continue;
             }
             if (depth == 2) {
-                if (token == "tcGen" && index + 1 < tokens.size() &&
+                if (_stricmp(token.c_str(), "tcGen") == 0 && argsAvailable(index, 1) &&
                     _stricmp(tokens[index + 1].c_str(), "environment") == 0) {
                     stageHasEnvironment = true;
                     currentStage.environmentMap = true;
-                } else if (_stricmp(token.c_str(), "blendFunc") == 0 && index + 1 < tokens.size()) {
+                } else if (_stricmp(token.c_str(), "blendFunc") == 0 && argsAvailable(index, 1)) {
                     const std::string &first = tokens[index + 1];
                     // blendFunc either takes a factor pair (GL_ONE GL_ONE) or a single
                     // mnemonic (add/blend/filter); consuming the wrong count eats a brace
                     // and desynchronises the rest of the file.
-                    if (_strnicmp(first.c_str(), "GL_", 3) == 0 && index + 2 < tokens.size()) {
+                    if (_strnicmp(first.c_str(), "GL_", 3) == 0 && argsAvailable(index, 2)) {
                         stageBlend = BlendTypeForFactors(first, tokens[index + 2]);
                         stageBlendSrc = BlendFactorForName(first, QR_BLEND_FACTOR_ONE);
                         stageBlendDst = BlendFactorForName(tokens[index + 2], QR_BLEND_FACTOR_ZERO);
@@ -1616,7 +1728,7 @@ void LoadShaderScripts()
                             stageBlendDst != QR_BLEND_FACTOR_ZERO;
                         ++index;
                     }
-                } else if (_stricmp(token.c_str(), "alphaFunc") == 0 && index + 1 < tokens.size()) {
+                } else if (_stricmp(token.c_str(), "alphaFunc") == 0 && argsAvailable(index, 1)) {
                     // Q3 cuts these stages out of the rasterized surface (grates, foliage,
                     // chains). QuakeRay has a dedicated alpha tested hit group for that.
                     stageAlphaTested = true;
@@ -1626,13 +1738,13 @@ void LoadShaderScripts()
                     // shader definition in the file.
                     ++index;
                 } else if (_stricmp(token.c_str(), "map") == 0 || _stricmp(token.c_str(), "clampmap") == 0) {
-                    if (index + 1 < tokens.size()) {
+                    if (argsAvailable(index, 1)) {
                         stageMap = tokens[index + 1];
                         currentStage.map = stageMap;
                         currentStage.lightmap = _stricmp(stageMap.c_str(), "$lightmap") == 0;
                         ++index;
                     }
-                } else if (_stricmp(token.c_str(), "animMap") == 0 && index + 2 < tokens.size()) {
+                } else if (_stricmp(token.c_str(), "animMap") == 0 && argsAvailable(index, 2)) {
                     currentStage.animationFps = std::max(
                         static_cast<float>(std::atof(tokens[index + 1].c_str())), 0.001f);
                     currentStage.animationMaps.clear();
@@ -1652,14 +1764,14 @@ void LoadShaderScripts()
                     currentStage.animated = currentStage.animated ||
                         currentStage.animationMaps.size() > 1u;
                     index = frameIndex - 1u;
-                } else if (_stricmp(token.c_str(), "tcMod") == 0 && index + 1 < tokens.size()) {
+                } else if (_stricmp(token.c_str(), "tcMod") == 0 && argsAvailable(index, 1)) {
                     // tcMod sub-commands take a variable number of arguments, so only the
                     // ones that matter here are consumed; eating a fixed count would
                     // swallow the closing brace of the stage.
                     const char *subCommand = tokens[index + 1].c_str();
                     currentStage.dynamic = true;
                     currentStage.animated = true;
-                    if (_stricmp(subCommand, "scale") == 0 && index + 3 < tokens.size()) {
+                    if (_stricmp(subCommand, "scale") == 0 && argsAvailable(index, 3)) {
                         stageScale[0] = static_cast<float>(std::atof(tokens[index + 2].c_str()));
                         stageScale[1] = static_cast<float>(std::atof(tokens[index + 3].c_str()));
                         if (stageScale[0] == 0.0f) {
@@ -1669,13 +1781,13 @@ void LoadShaderScripts()
                             stageScale[1] = 1.0f;
                         }
                         index += 3;
-                    } else if (_stricmp(subCommand, "scroll") == 0 && index + 3 < tokens.size()) {
+                    } else if (_stricmp(subCommand, "scroll") == 0 && argsAvailable(index, 3)) {
                         currentStage.scroll[0] +=
                             static_cast<float>(std::atof(tokens[index + 2].c_str()));
                         currentStage.scroll[1] +=
                             static_cast<float>(std::atof(tokens[index + 3].c_str()));
                         index += 3;
-                    } else if (_stricmp(subCommand, "rotate") == 0 && index + 2 < tokens.size()) {
+                    } else if (_stricmp(subCommand, "rotate") == 0 && argsAvailable(index, 2)) {
                         index += 2;
                     } else if (_stricmp(subCommand, "entityTranslate") == 0) {
                         index += 1;
@@ -1684,7 +1796,7 @@ void LoadShaderScripts()
                     _stricmp(token.c_str(), "alphaGen") == 0) &&
                     index + 1 < tokens.size() &&
                     _stricmp(tokens[index + 1].c_str(), "wave") == 0 &&
-                    index + 6 < tokens.size()) {
+                    argsAvailable(index, 6)) {
                     const ShaderWaveType wave = ParseShaderWave(tokens[index + 2]);
                     if (wave != SHADER_WAVE_NONE) {
                         const bool alpha = _stricmp(token.c_str(), "alphaGen") == 0;
@@ -1815,12 +1927,11 @@ QrMaterial GetScaledEnvMaterialForTextureName(const char *name, float scale, flo
         return GetMaterialForTextureName(name);
     }
 
-    static std::unordered_map<std::string, QrMaterial> scaledMaterials;
     char key[540] = {};
     snprintf(key, sizeof(key), "%s|%.3f|%.3f",
         NormalizeShaderName(name == nullptr ? "" : name).c_str(), factor, saturationFactor);
-    const auto existing = scaledMaterials.find(key);
-    if (existing != scaledMaterials.end()) {
+    const auto existing = scaledEnvMaterials.find(key);
+    if (existing != scaledEnvMaterials.end()) {
         return existing->second;
     }
 
@@ -1849,7 +1960,7 @@ QrMaterial GetScaledEnvMaterialForTextureName(const char *name, float scale, flo
     if (material == QR_NO_MATERIAL) {
         material = GetMaterialForTextureName(name);
     }
-    scaledMaterials.emplace(key, material);
+    scaledEnvMaterials.emplace(key, material);
     return material;
 }
 
@@ -2095,10 +2206,17 @@ void ResetMaterialState()
     // Handles stay valid because the shader names are owned by the host, but every
     // QrMaterial was destroyed together with the old QuakeRay instance.
     uiMaterials.clear();
+    uiMaterialsRaw.clear();
     textureMaterials.clear();
+    textureMaterialsRaw.clear();
+    scaledEnvMaterials.clear();
     shaderMaterials.clear();
     shaderMaterialAttempted.clear();
     defaultMaterial = QR_NO_MATERIAL;
+    skyAtlasMaterial = QR_NO_MATERIAL;
+    skyAtlasAttempted = false;
+    skyAtlasFaceSize = 0;
+    worldClusters.uploaded = false;
     markTriangles.clear();
     markGrid.clear();
     worldSurfaceInfos.clear();
@@ -2127,6 +2245,11 @@ void RebuildUiMaterials()
 bool CreateQrayInstance()
 {
     HostLog("CreateQrayInstance: start");
+
+    QrInstanceCreateInfo info{};
+#if defined(QR_USE_SURFACE_WIN32)
+    // Keep using GetWindowHandle on Windows: it predates GetNativeWindow, so a new
+    // renderer DLL stays compatible with an older client executable.
     void *windowHandle = ri.GetWindowHandle != nullptr ? ri.GetWindowHandle() : nullptr;
     if (windowHandle == nullptr) {
         HostLog("CreateQrayInstance: no window handle");
@@ -2138,11 +2261,34 @@ bool CreateQrayInstance()
     QrWin32SurfaceCreateInfo surfaceInfo{};
     surfaceInfo.hinstance = GetModuleHandleA(nullptr);
     surfaceInfo.hwnd = static_cast<HWND>(windowHandle);
+    info.pWin32SurfaceInfo = &surfaceInfo;
+#elif defined(QR_USE_SURFACE_XLIB)
+    nativeWindow_t nativeWindow{};
+    if (ri.GetNativeWindow == nullptr || !ri.GetNativeWindow(&nativeWindow)) {
+        HostLog("CreateQrayInstance: no native window");
+        ri.Printf(PRINT_WARNING, "rendererqray: no native window available\n");
+        return false;
+    }
+    if (nativeWindow.type != NATIVE_WINDOW_X11 || nativeWindow.display == nullptr || nativeWindow.window == 0) {
+        HostLog("CreateQrayInstance: unsupported window system type=%d", static_cast<int>(nativeWindow.type));
+        ri.Printf(PRINT_WARNING,
+            "rendererqray: QuakeRay needs an X11 window (got window system %d). "
+            "On Wayland run with SDL_VIDEODRIVER=x11 to use XWayland.\n",
+            static_cast<int>(nativeWindow.type));
+        return false;
+    }
+    HostLog("CreateQrayInstance: x11 display=%p window=0x%llx", nativeWindow.display, nativeWindow.window);
 
-    QrInstanceCreateInfo info{};
+    QrXlibSurfaceCreateInfo surfaceInfo{};
+    surfaceInfo.dpy = nativeWindow.display;
+    surfaceInfo.window = static_cast<unsigned long>(nativeWindow.window);
+    info.pXlibSurfaceCreateInfo = &surfaceInfo;
+#else
+#error "rendererqray: QuakeRay SDK was built without a supported surface type"
+#endif
+
     info.pAppName = "QuakeRay";
     info.pAppGUID = "6f6f4e42-2f8b-4d5f-9c8b-4a7b1c2d3e4f";
-    info.pWin32SurfaceInfo = &surfaceInfo;
     info.pConfigPath = CvarText(qrayConfig, "qray.cfg");
     info.pfnPrint = QrayPrint;
     info.pShaderFolderPath = CvarText(qrayShaderDir, "qray/shaders/");
@@ -3288,30 +3434,31 @@ void UploadClusterLightSources()
     }
 }
 
-float Bernstein(int degree, int index, float t)
-{
-    float coefficient = 1.0f;
-    for (int i = 1; i <= index; ++i) {
-        coefficient *= static_cast<float>(degree - index + i) / static_cast<float>(i);
-    }
-    return coefficient * std::pow(t, static_cast<float>(index)) *
-        std::pow(1.0f - t, static_cast<float>(degree - index));
-}
-
+// A Quake 3 patch is a grid of biquadratic Bezier sub-patches that share their edge
+// rows and columns (control points step by two), not one Bezier of degree (W-1, H-1).
+// Evaluating it as a single high-degree surface pulls wide patches away from their
+// shared control points and opens cracks against the neighbouring brushwork.
 void EvaluatePatch(const drawVert_t *control, int width, int height,
     float u, float v, float outPosition[3], float outTexCoord[2])
 {
     outPosition[0] = outPosition[1] = outPosition[2] = 0.0f;
     outTexCoord[0] = outTexCoord[1] = 0.0f;
 
-    const int degreeU = width - 1;
-    const int degreeV = height - 1;
-    for (int y = 0; y < height; ++y) {
-        const float basisV = Bernstein(degreeV, y, v);
-        for (int x = 0; x < width; ++x) {
-            const float basisU = Bernstein(degreeU, x, u);
-            const float weight = basisU * basisV;
-            const drawVert_t &point = control[y * width + x];
+    const int subPatchesU = std::max(1, (width - 1) / 2);
+    const int subPatchesV = std::max(1, (height - 1) / 2);
+    float fu = std::clamp(u, 0.0f, 1.0f) * static_cast<float>(subPatchesU);
+    float fv = std::clamp(v, 0.0f, 1.0f) * static_cast<float>(subPatchesV);
+    const int patchU = std::min(static_cast<int>(fu), subPatchesU - 1);
+    const int patchV = std::min(static_cast<int>(fv), subPatchesV - 1);
+    fu -= static_cast<float>(patchU);
+    fv -= static_cast<float>(patchV);
+
+    const float basisU[3] = {(1.0f - fu) * (1.0f - fu), 2.0f * fu * (1.0f - fu), fu * fu};
+    const float basisV[3] = {(1.0f - fv) * (1.0f - fv), 2.0f * fv * (1.0f - fv), fv * fv};
+    for (int y = 0; y < 3; ++y) {
+        for (int x = 0; x < 3; ++x) {
+            const float weight = basisU[x] * basisV[y];
+            const drawVert_t &point = control[(patchV * 2 + y) * width + (patchU * 2 + x)];
             outPosition[0] += point.xyz[0] * weight;
             outPosition[1] += point.xyz[1] * weight;
             outPosition[2] += point.xyz[2] * weight;
@@ -3579,7 +3726,6 @@ void ComputeSkyAverageColor(const std::vector<std::vector<uint8_t>> &faces)
 // feed that pass, so the composed faces are also packed into a single atlas that the overlay
 // draws as six inward facing quads. Face order and orientation match SkyFaceDirection, which
 // keeps the box, the cloud stages and the drawn geometry consistent with each other.
-int skyAtlasFaceSize = 0;
 
 void DestroySkyAtlas()
 {
@@ -3794,21 +3940,37 @@ void BuildMarkAcceleration(const std::vector<GeometryBatch> &batches)
             triangle.normal[1] = normal[1] / length;
             triangle.normal[2] = normal[2] / length;
 
-            const uint32_t triangleIndex = static_cast<uint32_t>(markTriangles.size());
-            markTriangles.push_back(triangle);
-
             int minCell[3] = {};
             int maxCell[3] = {};
-            for (int axis = 0; axis < 3; ++axis) {
+            bool inRange = true;
+            for (int axis = 0; axis < 3 && inRange; ++axis) {
                 float low = triangle.points[0][axis];
                 float high = low;
                 for (int corner = 1; corner < 3; ++corner) {
                     low = std::min(low, triangle.points[corner][axis]);
                     high = std::max(high, triangle.points[corner][axis]);
                 }
+                // Malformed BSP coordinates (NaN, huge values) would make the float to int
+                // casts undefined and the cell loop below effectively unbounded.
+                constexpr float kMaxWorldCoord = 262144.0f;
+                if (!std::isfinite(low) || !std::isfinite(high) || low < -kMaxWorldCoord || high > kMaxWorldCoord) {
+                    inRange = false;
+                    break;
+                }
                 minCell[axis] = static_cast<int>(std::floor((low - 1.0f) / kMarkCellSize));
                 maxCell[axis] = static_cast<int>(std::floor((high + 1.0f) / kMarkCellSize));
             }
+            if (!inRange) {
+                continue;
+            }
+            const int64_t cellSpan = static_cast<int64_t>(maxCell[0] - minCell[0] + 1) *
+                (maxCell[1] - minCell[1] + 1) * (maxCell[2] - minCell[2] + 1);
+            if (cellSpan > 65536) {
+                continue;
+            }
+
+            const uint32_t triangleIndex = static_cast<uint32_t>(markTriangles.size());
+            markTriangles.push_back(triangle);
             for (int x = minCell[0]; x <= maxCell[0]; ++x) {
                 for (int y = minCell[1]; y <= maxCell[1]; ++y) {
                     for (int z = minCell[2]; z <= maxCell[2]; ++z) {
@@ -3842,6 +4004,9 @@ bool LoadBspGeometryInner(const char *name)
         worldMin[i] = 1.0e30f;
         worldMax[i] = -1.0e30f;
     }
+    // Decals must never be projected against the previous map if this load fails.
+    markTriangles.clear();
+    markGrid.clear();
     void *fileData = nullptr;
     int fileLength = ri.FS_ReadFile(name, &fileData);
     HostLog("LoadBspGeometry: FS_ReadFile len=%d data=%p", fileLength, fileData);
@@ -3849,6 +4014,17 @@ bool LoadBspGeometryInner(const char *name)
         ri.Printf(PRINT_WARNING, "rendererqray: cannot read %s\n", name);
         return false;
     }
+    // Released on every exit path, including exceptions (bad_alloc) on the Linux path.
+    struct FileGuard {
+        void *data;
+        ~FileGuard() { if (data != nullptr) { ri.FS_FreeFile(data); } }
+    } fileGuard{fileData};
+    // An exception between qrBeginStaticGeometries and qrSubmitStaticGeometries must not
+    // leave the SDK's static-geometry window open.
+    struct StaticGeometryGuard {
+        bool open = false;
+        ~StaticGeometryGuard() { if (open && qrayInstance != QR_NULL_HANDLE) { qrSubmitStaticGeometries(qrayInstance); } }
+    } staticGuard;
 
     bool loaded = false;
     const auto *base = static_cast<const uint8_t *>(fileData);
@@ -3926,6 +4102,7 @@ bool LoadBspGeometryInner(const char *name)
             if (beginResult != QR_SUCCESS) {
                 ri.Printf(PRINT_WARNING, "rendererqray: qrBeginStaticGeometries failed: %d\n", static_cast<int>(beginResult));
             } else {
+                staticGuard.open = true;
                 int uploaded = 0;
                 int planarWindingKept = 0;
                 std::vector<GeometryBatch> batches(static_cast<size_t>(shaderCount));
@@ -3936,8 +4113,13 @@ bool LoadBspGeometryInner(const char *name)
                         continue;
                     }
                     if (surface.surfaceType == MST_PATCH) {
-                        if (surface.patchWidth < 2 || surface.patchHeight < 2 ||
-                            surface.patchWidth * surface.patchHeight > surface.numVerts) {
+                        // Q3 patches have odd dimensions (3, 5, 7, ...) up to MAX_PATCH_SIZE;
+                        // the 64-bit product cannot wrap for hostile values.
+                        constexpr int kMaxPatchSize = 65;
+                        if (surface.patchWidth < 3 || surface.patchHeight < 3 ||
+                            surface.patchWidth > kMaxPatchSize || surface.patchHeight > kMaxPatchSize ||
+                            (surface.patchWidth & 1) == 0 || (surface.patchHeight & 1) == 0 ||
+                            static_cast<int64_t>(surface.patchWidth) * surface.patchHeight > surface.numVerts) {
                             continue;
                         }
                     } else if (surface.numVerts < 3 || surface.numIndexes < 3) {
@@ -3960,7 +4142,6 @@ bool LoadBspGeometryInner(const char *name)
                         if (mapSkyShaderName.empty()) {
                             mapSkyShaderName = shader.shader;
                         }
-                        MarkSkyCluster(ClusterIndexForPoint(verts[surface.firstVert].xyz));
                         MarkSkyCluster(ClusterIndexForPoint(verts[surface.firstVert].xyz));
                         continue;
                     }
@@ -4331,6 +4512,7 @@ bool LoadBspGeometryInner(const char *name)
                         HostLog("LoadBspGeometry: batch %zu upload failed result=%d", batchIndex, static_cast<int>(uploadResult));
                     }
                 }
+                staticGuard.open = false;
                 const QrResult submitResult = qrSubmitStaticGeometries(qrayInstance);
                 HostLog("LoadBspGeometry: qrSubmitStaticGeometries result=%d alphaTestedBatches=%d "
                     "overlayBatches=%d overlayStages=%zu",
@@ -4375,17 +4557,26 @@ bool LoadBspGeometryInner(const char *name)
         ri.Printf(PRINT_WARNING, "rendererqray: %s is not a Quake 3 BSP\n", name);
     }
 
-    ri.FS_FreeFile(fileData);
     return loaded;
 }
 
 bool LoadBspGeometry(const char *name)
 {
+#ifdef _WIN32
     __try {
         return LoadBspGeometryInner(name);
     } __except (HostExceptionFilter(GetExceptionInformation())) {
         return false;
     }
+#else
+    try {
+        return LoadBspGeometryInner(name);
+    } catch (const std::exception &exception) {
+        HostLog("LoadBspGeometry: exception: %s", exception.what());
+        ri.Printf(PRINT_WARNING, "rendererqray: failed to load %s: %s\n", name, exception.what());
+        return false;
+    }
+#endif
 }
 
 void ResetReadback()
@@ -4454,7 +4645,8 @@ void UpdateReadback(bool allowRequest)
         QrBool32 done = QR_FALSE;
         const QrResult result = qrGetFrameReadbackStatus(qrayInstance, readbackRequest, &done);
         if (result == QR_SUCCESS && done == QR_TRUE) {
-            readbackReadyPixels.assign(readbackBuffer.begin(), readbackBuffer.end());
+            readbackReadyPixels.swap(readbackBuffer);
+            readbackBuffer.resize(static_cast<size_t>(readbackBufferSize));
             readbackValid = true;
             readbackPending = false;
         } else if (result == QR_READBACK_FAILED || result == QR_READBACK_INVALID) {
@@ -4465,37 +4657,63 @@ void UpdateReadback(bool allowRequest)
 
 void CopyReadbackToCapture()
 {
-    if (!capturePending || !readbackValid || captureBuffer == nullptr || readbackWidth == 0 || readbackHeight == 0) {
+    if (!capturePending) {
+        return;
+    }
+    // TakeVideoFrame hands over client-owned buffers that are only valid for this
+    // call sequence (CL_CloseAVI frees them), so a frame is never deferred.
+    capturePending = false;
+    if (captureBuffer == nullptr || captureWidth <= 0 || captureHeight <= 0) {
         return;
     }
 
-    const int width = std::min<int>(captureWidth, static_cast<int>(readbackWidth));
-    const int height = std::min<int>(captureHeight, static_cast<int>(readbackHeight));
-    byte *dst = captureBuffer;
-    const size_t dstPitch = static_cast<size_t>(width) * 3;
-    const size_t srcPitch = readbackRowPitch;
+    // Produce exactly what RB_TakeVideoFrameCmd produces: captureWidth x captureHeight,
+    // bottom-up RGB rows (glReadPixels order). Pixels the readback does not cover, or the
+    // whole frame while no readback is ready yet, are black so the AVI keeps its timing.
+    const int width = captureWidth;
+    const int height = captureHeight;
+    const size_t linePitch = static_cast<size_t>(width) * 3;
+    const bool haveReadback = readbackValid && readbackWidth > 0 && readbackHeight > 0 &&
+        readbackReadyPixels.size() >= static_cast<size_t>(readbackRowPitch) * readbackHeight;
+    const int copyWidth = haveReadback ? std::min<int>(width, static_cast<int>(readbackWidth)) : 0;
+    const int copyHeight = haveReadback ? std::min<int>(height, static_cast<int>(readbackHeight)) : 0;
 
-    for (int y = 0; y < height; ++y) {
-        const uint8_t *srcRow = readbackReadyPixels.data() + static_cast<size_t>(y) * srcPitch;
-        for (int x = 0; x < width; ++x) {
-            dst[0] = srcRow[x * 4 + 0];
-            dst[1] = srcRow[x * 4 + 1];
-            dst[2] = srcRow[x * 4 + 2];
-            dst += 3;
+    std::memset(captureBuffer, 0, linePitch * static_cast<size_t>(height));
+    for (int y = 0; y < copyHeight; ++y) {
+        const uint8_t *srcRow = readbackReadyPixels.data() + static_cast<size_t>(y) * readbackRowPitch;
+        byte *dstRow = captureBuffer + static_cast<size_t>(height - 1 - y) * linePitch;
+        for (int x = 0; x < copyWidth; ++x) {
+            dstRow[x * 3 + 0] = srcRow[x * 4 + 0];
+            dstRow[x * 3 + 1] = srcRow[x * 4 + 1];
+            dstRow[x * 3 + 2] = srcRow[x * 4 + 2];
         }
     }
 
-    if (captureMotionJpeg && captureEncodeBuffer != nullptr) {
-        const size_t encodedSize = ri.CL_SaveJPGToBuffer(captureEncodeBuffer, dstPitch * static_cast<size_t>(height), 85,
+    if (captureEncodeBuffer == nullptr) {
+        return;
+    }
+    if (captureMotionJpeg) {
+        const size_t encodedSize = ri.CL_SaveJPGToBuffer(captureEncodeBuffer, linePitch * static_cast<size_t>(height), 90,
             width, height, captureBuffer, 0);
         if (encodedSize > 0) {
             ri.CL_WriteAVIVideoFrame(captureEncodeBuffer, static_cast<int>(encodedSize));
         }
-    } else {
-        ri.CL_WriteAVIVideoFrame(captureBuffer, static_cast<int>(dstPitch * static_cast<size_t>(height)));
+        return;
     }
 
-    capturePending = false;
+    // Uncompressed AVI: BGR with rows padded to AVI_LINE_PADDING (4 bytes).
+    const size_t aviPitch = (linePitch + 3u) & ~static_cast<size_t>(3u);
+    for (int y = 0; y < height; ++y) {
+        const byte *srcRow = captureBuffer + static_cast<size_t>(y) * linePitch;
+        byte *dstRow = captureEncodeBuffer + static_cast<size_t>(y) * aviPitch;
+        for (int x = 0; x < width; ++x) {
+            dstRow[x * 3 + 0] = srcRow[x * 3 + 2];
+            dstRow[x * 3 + 1] = srcRow[x * 3 + 1];
+            dstRow[x * 3 + 2] = srcRow[x * 3 + 0];
+        }
+        std::memset(dstRow + linePitch, 0, aviPitch - linePitch);
+    }
+    ri.CL_WriteAVIVideoFrame(captureEncodeBuffer, static_cast<int>(aviPitch * static_cast<size_t>(height)));
 }
 
 void StartFrame()
@@ -4512,11 +4730,30 @@ void StartFrame()
     info.wantFullscreenExclusive = QR_FALSE;
     info.hasFocus = QR_TRUE;
 
-    const QrResult result = qrStartFrame(qrayInstance, &info);
+    QrResult result = qrStartFrame(qrayInstance, &info);
+    if (result == QR_FEATURE_UNAVAILABLE && info.presentMode != QR_PRESENT_MODE_VSYNC) {
+        // SDK 0.2+ no longer substitutes a present mode the surface lacks (IMMEDIATE is
+        // missing on several Linux/X11 drivers); fall back to FIFO instead of a black screen.
+        static bool fallbackReported = false;
+        if (!fallbackReported) {
+            ri.Printf(PRINT_WARNING, "rendererqray: present mode %d unavailable, using vsync\n",
+                static_cast<int>(info.presentMode));
+            fallbackReported = true;
+        }
+        info.presentMode = QR_PRESENT_MODE_VSYNC;
+        info.maxFrameLatency = 1u;
+        result = qrStartFrame(qrayInstance, &info);
+    }
+    static QrResult lastStartFailure = QR_SUCCESS;
     if (result != QR_SUCCESS) {
-        ri.Printf(PRINT_WARNING, "rendererqray: qrStartFrame failed: %d\n", static_cast<int>(result));
+        // Minimised or suspended swapchains fail every frame; report each new code once.
+        if (result != lastStartFailure) {
+            ri.Printf(PRINT_WARNING, "rendererqray: qrStartFrame failed: %d\n", static_cast<int>(result));
+            lastStartFailure = result;
+        }
         return;
     }
+    lastStartFailure = QR_SUCCESS;
 
     frameStarted = true;
     sceneRendered = false;
@@ -4529,7 +4766,10 @@ void StartFrame()
         worldLoaded = true;
     }
 
-    UpdateReadback(true);
+    UpdateReadback(readbackWantedFrames > 0);
+    if (readbackWantedFrames > 0) {
+        --readbackWantedFrames;
+    }
 }
 
 uint64_t NextDynamicGeometryId()
@@ -5826,14 +6066,18 @@ void ShutdownRenderer(refShutdownCode_t code)
     if (frameStarted && qrayInstance != QR_NULL_HANDLE) {
         DrawFrame();
     }
-    ResetReadback();
-    capturePending = false;
 
+    // The SDK may still write into readbackBuffer until the instance is gone, so the
+    // host buffers are released only after qrDestroyInstance.
     if (qrayInstance != QR_NULL_HANDLE) {
+        DestroySkyAtlas();
         DestroySkyCubemap();
         qrDestroyInstance(qrayInstance);
         qrayInstance = QR_NULL_HANDLE;
     }
+    ResetReadback();
+    capturePending = false;
+    captureBuffer = nullptr;
 
     if (code == REF_UNLOAD_DLL && commandsRegistered) {
         ri.Cmd_RemoveCommand("screenshot");
@@ -5850,6 +6094,7 @@ void ShutdownRenderer(refShutdownCode_t code)
 
     if (code != REF_KEEP_CONTEXT && code != REF_KEEP_WINDOW) {
         ri.VKimp_Shutdown(code == REF_UNLOAD_DLL ? qtrue : qfalse);
+        windowInitialized = false;
     }
 }
 
@@ -5859,9 +6104,12 @@ void BeginRegistration(glconfig_t *config)
     RegisterCvars();
 
     if (config != nullptr) {
-        if (qrayInstance == QR_NULL_HANDLE) {
+        if (!windowInitialized) {
+            // vid_restart with REF_KEEP_WINDOW keeps the native window alive while the
+            // QuakeRay instance is recreated; initialising it again would leak it.
             HostLog("BeginRegistration: VKimp_Init");
             ri.VKimp_Init(config);
+            windowInitialized = true;
             glConfig = *config;
             HostLog("BeginRegistration: VKimp_Init done %dx%d", glConfig.vidWidth, glConfig.vidHeight);
         } else {
@@ -5923,6 +6171,24 @@ void EndRegistration()
     HostLog("EndRegistration");
 }
 
+// Console commands can be issued by game VMs (trap_SendConsoleCommand), so file names
+// for the screenshot/readback commands must stay relative and inside the game root.
+bool IsSafeOutputFileName(const char *name)
+{
+    if (name == nullptr || name[0] == '\0' || name[0] == '/' || name[0] == '\\') {
+        return false;
+    }
+    if (std::strstr(name, "..") != nullptr || std::strchr(name, ':') != nullptr) {
+        return false;
+    }
+    for (const char *c = name; *c != '\0'; ++c) {
+        if (static_cast<unsigned char>(*c) < 0x20) {
+            return false;
+        }
+    }
+    return true;
+}
+
 void QrayScreenshot_f()
 {
     if (qrayInstance == QR_NULL_HANDLE) {
@@ -5932,6 +6198,10 @@ void QrayScreenshot_f()
     const char *name = ri.Cmd_Argc() > 1 ? ri.Cmd_Argv(1) : "";
     if (name[0] == '\0' || _stricmp(name, "silent") == 0 || _stricmp(name, "levelshot") == 0) {
         name = "qray-screenshot.png";
+    }
+    if (!IsSafeOutputFileName(name)) {
+        ri.Printf(PRINT_WARNING, "rendererqray: refusing unsafe screenshot name '%s'\n", name);
+        return;
     }
 
     const QrResult result = qrRequestScreenshot(qrayInstance, name);
@@ -5944,9 +6214,10 @@ void QrayScreenshot_f()
 
 void QrayReadbackDump_f()
 {
+    readbackWantedFrames = kReadbackKeepAliveFrames;
     if (!readbackValid || readbackWidth == 0 || readbackHeight == 0 ||
         readbackReadyPixels.size() < static_cast<size_t>(readbackWidth) * readbackHeight * 4) {
-        ri.Printf(PRINT_WARNING, "rendererqray: no completed readback frame available\n");
+        ri.Printf(PRINT_WARNING, "rendererqray: no completed readback frame yet; readback started, run qray_readback again\n");
         return;
     }
 
@@ -5954,29 +6225,41 @@ void QrayReadbackDump_f()
     const uint32_t height = readbackHeight;
     const uint32_t imageSize = width * height * 4;
 
-    BITMAPFILEHEADER fileHeader{};
-    fileHeader.bfType = 0x4D42;
-    fileHeader.bfOffBits = sizeof(BITMAPFILEHEADER) + sizeof(BITMAPINFOHEADER);
-    fileHeader.bfSize = fileHeader.bfOffBits + imageSize;
-
-    BITMAPINFOHEADER infoHeader{};
-    infoHeader.biSize = sizeof(BITMAPINFOHEADER);
-    infoHeader.biWidth = static_cast<LONG>(width);
-    infoHeader.biHeight = -static_cast<LONG>(height);
-    infoHeader.biPlanes = 1;
-    infoHeader.biBitCount = 32;
-    infoHeader.biCompression = BI_RGB;
-    infoHeader.biSizeImage = imageSize;
+    // BITMAPFILEHEADER (14 bytes) + BITMAPINFOHEADER (40 bytes), little endian, written
+    // by hand so the dump does not depend on <windows.h> or struct packing.
+    uint8_t header[54] = {};
+    const auto put16 = [&header](size_t offset, uint32_t value) {
+        header[offset + 0] = static_cast<uint8_t>(value & 0xffu);
+        header[offset + 1] = static_cast<uint8_t>((value >> 8) & 0xffu);
+    };
+    const auto put32 = [&header](size_t offset, uint32_t value) {
+        for (size_t i = 0; i < 4; ++i) {
+            header[offset + i] = static_cast<uint8_t>((value >> (8 * i)) & 0xffu);
+        }
+    };
+    put16(0, 0x4D42u);                                     // bfType 'BM'
+    put32(2, static_cast<uint32_t>(sizeof(header)) + imageSize); // bfSize
+    put32(10, static_cast<uint32_t>(sizeof(header)));      // bfOffBits
+    put32(14, 40u);                                         // biSize
+    put32(18, width);                                       // biWidth
+    put32(22, static_cast<uint32_t>(-static_cast<int32_t>(height))); // top-down
+    put16(26, 1u);                                          // biPlanes
+    put16(28, 32u);                                         // biBitCount
+    put32(30, 0u);                                          // BI_RGB
+    put32(34, imageSize);                                   // biSizeImage
 
     const char *name = ri.Cmd_Argc() > 1 ? ri.Cmd_Argv(1) : "qray-readback.bmp";
+    if (!IsSafeOutputFileName(name)) {
+        ri.Printf(PRINT_WARNING, "rendererqray: refusing unsafe readback name '%s'\n", name);
+        return;
+    }
     std::ofstream stream(name, std::ios::binary);
     if (!stream.is_open()) {
         ri.Printf(PRINT_WARNING, "rendererqray: cannot write %s\n", name);
         return;
     }
 
-    stream.write(reinterpret_cast<const char *>(&fileHeader), sizeof(fileHeader));
-    stream.write(reinterpret_cast<const char *>(&infoHeader), sizeof(infoHeader));
+    stream.write(reinterpret_cast<const char *>(header), sizeof(header));
     for (uint32_t y = 0; y < height; ++y) {
         const uint8_t *row = readbackReadyPixels.data() + static_cast<size_t>(y) * readbackRowPitch;
         for (uint32_t x = 0; x < width; ++x) {
@@ -6340,7 +6623,7 @@ void SetColor(const float *rgba)
 
 void DrawStretchPic(float x, float y, float w, float h, float s1, float t1, float s2, float t2, qhandle_t shader)
 {
-    if (qrayInstance == QR_NULL_HANDLE || w <= 0.0f || h <= 0.0f) {
+    if (qrayInstance == QR_NULL_HANDLE || !frameStarted || w <= 0.0f || h <= 0.0f) {
         return;
     }
 
@@ -6746,7 +7029,10 @@ void TakeVideoFrame(int h, int w, byte *capture, byte *encode, qboolean motionJp
     captureEncodeBuffer = encode;
     captureMotionJpeg = motionJpeg != qfalse;
     capturePending = true;
+    readbackWantedFrames = kReadbackKeepAliveFrames;
     CopyReadbackToCapture();
+    captureBuffer = nullptr;
+    captureEncodeBuffer = nullptr;
 }
 
 void ThrottleBackend()
@@ -6879,11 +7165,24 @@ bool LoadMd3Asset(const char *name, ModelAsset &asset)
 
                     const auto *triangles = reinterpret_cast<const md3Triangle_t *>(surfaceData + surface->ofsTriangles);
                     modelSurface.indices.reserve(static_cast<size_t>(triangleCount) * 3);
-                    for (uint64_t triangleIndex = 0; triangleIndex < triangleCount; ++triangleIndex) {
+                    bool indicesValid = true;
+                    for (uint64_t triangleIndex = 0; triangleIndex < triangleCount && indicesValid; ++triangleIndex) {
                         const md3Triangle_t &triangle = triangles[triangleIndex];
-                        modelSurface.indices.push_back(triangle.indexes[0]);
-                        modelSurface.indices.push_back(triangle.indexes[1]);
-                        modelSurface.indices.push_back(triangle.indexes[2]);
+                        for (int corner = 0; corner < 3; ++corner) {
+                            // The indexes go straight to qrUploadGeometry; an out-of-range
+                            // value would make the SDK read past the vertex array.
+                            const int vertex = triangle.indexes[corner];
+                            if (vertex < 0 || vertex >= surface->numVerts) {
+                                indicesValid = false;
+                                break;
+                            }
+                            modelSurface.indices.push_back(static_cast<uint32_t>(vertex));
+                        }
+                    }
+                    if (!indicesValid) {
+                        HostLog("LoadMd3Asset: %s has an out-of-range triangle index", name);
+                        asset.valid = false;
+                        break;
                     }
 
                     const auto *texCoords = reinterpret_cast<const md3St_t *>(surfaceData + surface->ofsSt);

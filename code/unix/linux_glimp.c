@@ -1987,7 +1987,19 @@ static qboolean GLW_StartVulkan( void )
 
 void *GLimp_GetWindowHandle( void )
 {
-	return NULL;
+	return (void *)(size_t)win;
+}
+
+
+qboolean GLimp_GetNativeWindow( nativeWindow_t *out )
+{
+	if ( out == NULL || dpy == NULL || win == 0 ) {
+		return qfalse;
+	}
+	out->type = NATIVE_WINDOW_X11;
+	out->display = (void *)dpy;
+	out->window = (unsigned long long)win;
+	return qtrue;
 }
 
 

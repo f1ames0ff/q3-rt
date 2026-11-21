@@ -1535,6 +1535,18 @@ void *GLimp_GetWindowHandle( void )
 }
 
 
+qboolean GLimp_GetNativeWindow( nativeWindow_t *out )
+{
+	if ( out == NULL || g_wv.hWnd == NULL ) {
+		return qfalse;
+	}
+	out->type = NATIVE_WINDOW_WIN32;
+	out->display = (void *)GetModuleHandle( NULL );
+	out->window = (unsigned long long)(size_t)g_wv.hWnd;
+	return qtrue;
+}
+
+
 /*
 ** VKimp_Shutdown
 **

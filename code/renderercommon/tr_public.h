@@ -27,6 +27,19 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 
 #define	REF_API_VERSION		8
 
+typedef enum {
+	NATIVE_WINDOW_NONE,
+	NATIVE_WINDOW_WIN32,	// display = HINSTANCE, window = HWND
+	NATIVE_WINDOW_X11,		// display = Display*, window = X11 Window XID
+	NATIVE_WINDOW_WAYLAND	// display = wl_display*, window = wl_surface*
+} nativeWindowType_t;
+
+typedef struct {
+	nativeWindowType_t	type;
+	void				*display;
+	unsigned long long	window;
+} nativeWindow_t;
+
 //
 // these are the functions exported by the refresh module
 //
@@ -229,6 +242,11 @@ typedef struct {
 	qboolean (*VK_CreateSurface)( VkInstance instance, VkSurfaceKHR *pSurface );
 
 	void*	(*GetWindowHandle)( void );
+
+	// Native window description for renderers that create their own presentation
+	// surface (rendererqray). Returns qfalse when no window exists or the
+	// windowing system is not supported by the platform layer.
+	qboolean (*GetNativeWindow)( nativeWindow_t *out );
 
 } refimport_t;
 

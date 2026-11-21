@@ -610,6 +610,7 @@ void	HandleEvents( void );
 void	GLimp_InitGamma(glconfig_t *config);
 void	GLimp_SetGamma(unsigned char red[256], unsigned char green[256], unsigned char blue[256]);
 void	*GLimp_GetWindowHandle( void );
+qboolean GLimp_GetNativeWindow( nativeWindow_t *out );
 
 // OpenGL
 #ifdef USE_OPENGL_API
