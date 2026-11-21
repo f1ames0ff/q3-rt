@@ -703,6 +703,51 @@ void *GLimp_GetWindowHandle( void )
 }
 
 
+qboolean GLimp_GetNativeWindow( nativeWindow_t *out )
+{
+	SDL_SysWMinfo info;
+
+	if ( out == NULL || SDL_window == NULL ) {
+		return qfalse;
+	}
+
+	SDL_VERSION( &info.version );
+	if ( !SDL_GetWindowWMInfo( SDL_window, &info ) ) {
+		Com_Printf( S_COLOR_YELLOW "SDL_GetWindowWMInfo failed: %s\n", SDL_GetError() );
+		return qfalse;
+	}
+
+	switch ( info.subsystem ) {
+#if defined( SDL_VIDEO_DRIVER_WINDOWS )
+	case SDL_SYSWM_WINDOWS:
+		out->type = NATIVE_WINDOW_WIN32;
+		out->display = (void *)info.info.win.hinstance;
+		out->window = (unsigned long long)(size_t)info.info.win.window;
+		return qtrue;
+#endif
+#if defined( SDL_VIDEO_DRIVER_X11 )
+	case SDL_SYSWM_X11:
+		out->type = NATIVE_WINDOW_X11;
+		out->display = (void *)info.info.x11.display;
+		out->window = (unsigned long long)info.info.x11.window;
+		return qtrue;
+#endif
+#if defined( SDL_VIDEO_DRIVER_WAYLAND )
+	case SDL_SYSWM_WAYLAND:
+		out->type = NATIVE_WINDOW_WAYLAND;
+		out->display = (void *)info.info.wl.display;
+		out->window = (unsigned long long)(size_t)info.info.wl.surface;
+		return qtrue;
+#endif
+	default:
+		out->type = NATIVE_WINDOW_NONE;
+		out->display = NULL;
+		out->window = 0;
+		return qfalse;
+	}
+}
+
+
 #ifdef USE_VULKAN_API
 /*
 ===============
