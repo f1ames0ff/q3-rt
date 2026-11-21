@@ -334,6 +334,24 @@ enum ShaderTcModType
     TCMOD_TURB
 };
 
+enum ShaderColorGen
+{
+    COLORGEN_DEFAULT,
+    COLORGEN_IDENTITY,
+    COLORGEN_VERTEX,
+    COLORGEN_ENTITY,
+    COLORGEN_WAVE
+};
+
+enum ShaderAlphaGen
+{
+    ALPHAGEN_DEFAULT,
+    ALPHAGEN_IDENTITY,
+    ALPHAGEN_VERTEX,
+    ALPHAGEN_ENTITY,
+    ALPHAGEN_WAVE
+};
+
 struct ShaderTcMod
 {
     ShaderTcModType type = TCMOD_SCALE;
@@ -357,6 +375,8 @@ struct ShaderStage
     bool clampMap = false;
     bool dynamic = false;
     bool animated = false;
+    ShaderColorGen rgbGen = COLORGEN_DEFAULT;
+    ShaderAlphaGen alphaGen = ALPHAGEN_DEFAULT;
     float scroll[2] = {0.0f, 0.0f};
     std::vector<ShaderTcMod> tcMods;
     ShaderWaveType rgbWave = SHADER_WAVE_NONE;
@@ -386,6 +406,14 @@ struct ShaderDefinition
     bool dynamic = false;
     bool transparentSurface = false;
     bool tracedBase = false;
+    // World cutout frame over an animated under-layer (e.g., demon_block15fx, killblockgeomtrn):
+    // the static stone frame is raytraced with alpha testing + opaque backing while the animated
+    // under-layer(s) draw behind it on the raster overlay with depth test enabled.
+    bool cutoutFrameUnderlay = false;
+    // Stage 0 tcGen environment chrome followed by alpha-blended colored lacquer (e.g., armor).
+    bool metallicEnvBase = false;
+    // Every non-lightmap stage is blended (e.g., weapon impact explosions, armor energy shell).
+    bool hasOnlyBlendedStages = false;
     size_t baseStageIndex = static_cast<size_t>(-1);
     std::vector<ShaderStage> stages;
     // q3map light emission. Retail Q3 bakes these into the lightmaps; the RT renderer turns
@@ -456,6 +484,7 @@ struct WorldOverlayBatch
     std::string shaderName;
     std::vector<QrVertex> vertices;
     std::vector<uint32_t> indices;
+    bool cutoutUnderlay = false;
 };
 
 std::vector<WorldOverlayBatch> worldOverlayBatches;
@@ -466,6 +495,7 @@ float skyAverageColor[3] = {0.20f, 0.25f, 0.35f};
 // QuakeRay only samples the cubemap its own sky pass rasterizes, so the sky of the map is also
 // composed into a flat atlas here and drawn as six inward facing quads by the overlay pass.
 QrMaterial skyAtlasMaterial = QR_NO_MATERIAL;
+QrMaterial cutoutBackingMaterial = QR_NO_MATERIAL;
 int skyAtlasFaceSize = 0;
 bool skyAtlasAttempted = false;
 std::unordered_map<qhandle_t, SkinAsset> skinAssets;
@@ -502,7 +532,13 @@ int64_t MarkCellKey(int x, int y, int z)
         static_cast<int64_t>(z) * 83492791ll;
 }
 
-std::vector<refEntity_t> pendingEntities;
+struct PendingEntity
+{
+    refEntity_t entity{};
+    float shaderTimeSeconds = 0.0f;
+};
+
+std::vector<PendingEntity> pendingEntities;
 std::vector<PendingPoly> pendingPolys;
 uint64_t dynamicGeometryId = 0x4000000000000000ull;
 
@@ -906,10 +942,10 @@ void RegisterCvars()
     qraySurfaceLightGlow = ri.Cvar_Get("qray_surfaceLightGlow", "1", CVAR_ARCHIVE | CVAR_LATCH);
     ri.Cvar_SetDescription(qraySurfaceLightGlow,
         "Write an emission mask into the materials of q3map_surfacelight shaders so the light surfaces themselves glow.");
-    qrayOverlayScale = ri.Cvar_Get("qray_overlayScale", "2.0", CVAR_ARCHIVE);
+    qrayOverlayScale = ri.Cvar_Get("qray_overlayScale", "1.0", CVAR_ARCHIVE);
     ri.Cvar_SetDescription(qrayOverlayScale,
         "HDR luminance multiplier for opaque and alpha-blended world shader overlays.");
-    qrayOverlayAddScale = ri.Cvar_Get("qray_overlayAddScale", "24.0", CVAR_ARCHIVE);
+    qrayOverlayAddScale = ri.Cvar_Get("qray_overlayAddScale", "1.5", CVAR_ARCHIVE);
     ri.Cvar_SetDescription(qrayOverlayAddScale,
         "HDR luminance multiplier for additive and emissive world shader overlays (flames, jump pads, lava).");
 
@@ -1164,20 +1200,62 @@ bool LoadQ3Texture(const char *shaderName, int &width, int &height, std::vector<
     return false;
 }
 
+void CleanAdditiveBlackBackground(std::vector<uint8_t> &pixels)
+{
+    for (size_t i = 0; i + 3 < pixels.size(); i += 4) {
+        const uint8_t peak = std::max({pixels[i + 0], pixels[i + 1], pixels[i + 2]});
+        if (peak <= 6) {
+            pixels[i + 0] = 0;
+            pixels[i + 1] = 0;
+            pixels[i + 2] = 0;
+        } else if (peak < 18) {
+            const float scale = static_cast<float>(peak - 6) / 12.0f;
+            for (int c = 0; c < 3; ++c) {
+                pixels[i + c] = static_cast<uint8_t>(std::clamp(
+                    static_cast<float>(pixels[i + c]) * scale, 0.0f, 255.0f));
+            }
+        }
+    }
+}
+
 QrMaterial CreateMaterialFromPixels(const char *name, int width, int height,
     const std::vector<uint8_t> &albedo, QrSamplerAddressMode addressMode,
-    const std::vector<uint8_t> *emission = nullptr)
+    const std::vector<uint8_t> *emission = nullptr, bool metallicEnvAlphaMask = false)
 {
     if (width <= 0 || height <= 0 || albedo.size() < static_cast<size_t>(width) * height * 4) {
         return QR_NO_MATERIAL;
     }
 
     const size_t pixelCount = static_cast<size_t>(width) * height;
+    const std::vector<uint8_t> *albedoSource = &albedo;
+    std::vector<uint8_t> metallicAlbedo;
     std::vector<uint8_t> roughnessMetallicEmission(pixelCount * 4, 255);
     std::vector<uint8_t> normal(pixelCount * 4, 255);
+    if (metallicEnvAlphaMask) {
+        metallicAlbedo = albedo;
+        albedoSource = &metallicAlbedo;
+    }
     for (size_t i = 0; i < pixelCount; ++i) {
-        roughnessMetallicEmission[i * 4 + 0] = 200;
-        roughnessMetallicEmission[i * 4 + 1] = 0;
+        uint8_t roughness = 200;
+        uint8_t metallic = 0;
+        if (metallicEnvAlphaMask) {
+            const float envMask = 1.0f - (static_cast<float>(albedo[i * 4 + 3]) / 255.0f);
+            roughness = static_cast<uint8_t>(
+                std::clamp(0.32f - 0.24f * envMask, 0.08f, 0.32f) * 255.0f);
+            metallic = static_cast<uint8_t>(
+                std::clamp(0.25f + 0.70f * envMask, 0.0f, 1.0f) * 255.0f);
+            // Replace Stage 0 tcGen environment silver specular highlight in transparent trim
+            // regions so metallic edges are not dark where alpha approaches 0.
+            const float chromeLift = envMask * 0.5f;
+            for (int c = 0; c < 3; ++c) {
+                const float v = static_cast<float>(metallicAlbedo[i * 4 + c]);
+                const float lifted = v + (215.0f - v) * chromeLift;
+                metallicAlbedo[i * 4 + c] = static_cast<uint8_t>(std::clamp(lifted, 0.0f, 255.0f));
+            }
+            metallicAlbedo[i * 4 + 3] = 255;
+        }
+        roughnessMetallicEmission[i * 4 + 0] = roughness;
+        roughnessMetallicEmission[i * 4 + 1] = metallic;
         roughnessMetallicEmission[i * 4 + 2] =
             (emission != nullptr && i < emission->size()) ? (*emission)[i] : 0;
         roughnessMetallicEmission[i * 4 + 3] = 255;
@@ -1191,7 +1269,7 @@ QrMaterial CreateMaterialFromPixels(const char *name, int width, int height,
     QrMaterialCreateInfo info{};
     info.size.width = static_cast<uint32_t>(width);
     info.size.height = static_cast<uint32_t>(height);
-    info.textures.pDataAlbedoAlpha = albedo.data();
+    info.textures.pDataAlbedoAlpha = albedoSource->data();
     info.textures.pDataRoughnessMetallicEmission = roughnessMetallicEmission.data();
     info.textures.pDataNormal = normal.data();
     info.pRelativePath = name;
@@ -1207,6 +1285,23 @@ QrMaterial CreateMaterialFromPixels(const char *name, int width, int height,
         return QR_NO_MATERIAL;
     }
     return material;
+}
+
+QrMaterial GetCutoutBackingMaterial()
+{
+    if (cutoutBackingMaterial != QR_NO_MATERIAL) {
+        return cutoutBackingMaterial;
+    }
+    if (qrayInstance == QR_NULL_HANDLE) {
+        return defaultMaterial;
+    }
+    const std::vector<uint8_t> darkAlbedo = {8, 8, 8, 255};
+    cutoutBackingMaterial = CreateMaterialFromPixels("_qray/cutout_backing", 1, 1, darkAlbedo,
+        QR_SAMPLER_ADDRESS_MODE_REPEAT);
+    if (cutoutBackingMaterial == QR_NO_MATERIAL) {
+        cutoutBackingMaterial = defaultMaterial;
+    }
+    return cutoutBackingMaterial;
 }
 
 std::string NormalizeShaderName(const std::string &name)
@@ -1694,6 +1789,24 @@ void LoadShaderScripts()
                     depth = 1;
                 } else if (depth == 1) {
                     if (!currentName.empty() && !currentStages.empty()) {
+                        const bool lightmapFirstOpaque = !currentTransparentSurface &&
+                            currentStages.size() >= 2 && currentStages[0].lightmap &&
+                            !currentStages[1].lightmap && !currentStages[1].animated &&
+                            !currentStages[1].environmentMap &&
+                            currentStages[1].blendSrc == QR_BLEND_FACTOR_DST_COLOR &&
+                            currentStages[1].blendDst == QR_BLEND_FACTOR_ZERO;
+                        if (lightmapFirstOpaque) {
+                            preferredMap = currentStages[1].map;
+                            preferredBlend = QR_GEOMETRY_MATERIAL_BLEND_TYPE_OPAQUE;
+                            preferredBlendSrc = QR_BLEND_FACTOR_ONE;
+                            preferredBlendDst = QR_BLEND_FACTOR_ZERO;
+                            preferredEnvironment = false;
+                            preferredStageChosen = true;
+                            preferredStageIndex = 1;
+                            preferredAlphaTested = preferredAlphaTested ||
+                                currentStages[1].alphaTested;
+                        }
+
                         ShaderDefinition definition;
                         definition.map = preferredMap;
                         definition.blend = preferredBlend;
@@ -1717,18 +1830,89 @@ void LoadShaderScripts()
                             (preferredBlend == QR_GEOMETRY_MATERIAL_BLEND_TYPE_OPAQUE ||
                              preferredAlphaTested);
                         definition.stages = currentStages;
-                        for (size_t stageIndex = 0; stageIndex < currentStages.size(); ++stageIndex) {
-                            const ShaderStage &stage = currentStages[stageIndex];
-                            const bool baseStage = definition.tracedBase &&
-                                stageIndex == definition.baseStageIndex;
-                            if (!baseStage && (stage.blended || stage.dynamic)) {
+
+                        bool hasLightmapStage = false;
+                        for (const ShaderStage &stage : currentStages) {
+                            if (stage.lightmap) {
+                                hasLightmapStage = true;
+                                break;
+                            }
+                        }
+                        if (!currentTransparentSurface && hasLightmapStage &&
+                            currentStages.size() >= 3 && !currentStages[0].blended &&
+                            currentStages[0].animated && !currentStages[0].environmentMap &&
+                            !currentStages[0].lightmap) {
+                            size_t frameIdx = static_cast<size_t>(-1);
+                            for (size_t si = 1; si < currentStages.size(); ++si) {
+                                const ShaderStage &stage = currentStages[si];
+                                if (!stage.lightmap && !stage.animated && !stage.environmentMap &&
+                                    stage.blendSrc == QR_BLEND_FACTOR_SRC_ALPHA &&
+                                    stage.blendDst == QR_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA) {
+                                    frameIdx = si;
+                                }
+                            }
+                            if (frameIdx != static_cast<size_t>(-1)) {
+                                definition.cutoutFrameUnderlay = true;
+                                definition.baseStageIndex = frameIdx;
+                                definition.map = currentStages[frameIdx].map;
+                                definition.blend = QR_GEOMETRY_MATERIAL_BLEND_TYPE_OPAQUE;
+                                definition.blendSrc = QR_BLEND_FACTOR_ONE;
+                                definition.blendDst = QR_BLEND_FACTOR_ZERO;
+                                definition.alphaTested = true;
+                                definition.environmentMap = false;
+                                definition.tracedBase = true;
                                 definition.usesOverlay = true;
                             }
-                            definition.dynamic = definition.dynamic || stage.dynamic;
                         }
-                        if (!definition.tracedBase) {
-                            definition.usesOverlay = true;
+
+                        if (!definition.cutoutFrameUnderlay && currentStages.size() >= 2 &&
+                            currentStages[0].environmentMap && !currentStages[0].blended &&
+                            !currentStages[1].environmentMap && !currentStages[1].lightmap &&
+                            !currentStages[1].animated &&
+                            currentStages[1].blendSrc == QR_BLEND_FACTOR_SRC_ALPHA &&
+                            currentStages[1].blendDst == QR_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA) {
+                            definition.metallicEnvBase = true;
+                            definition.map = currentStages[1].map;
+                            definition.blend = QR_GEOMETRY_MATERIAL_BLEND_TYPE_OPAQUE;
+                            definition.blendSrc = QR_BLEND_FACTOR_ONE;
+                            definition.blendDst = QR_BLEND_FACTOR_ZERO;
+                            definition.environmentMap = false;
+                            definition.baseStageIndex = 1;
+                            definition.tracedBase = !currentTransparentSurface;
+                            definition.usesOverlay = false;
                         }
+
+                        if (!definition.metallicEnvBase) {
+                            for (size_t stageIndex = 0; stageIndex < currentStages.size(); ++stageIndex) {
+                                const ShaderStage &stage = currentStages[stageIndex];
+                                const bool baseStage = definition.tracedBase &&
+                                    stageIndex == definition.baseStageIndex;
+                                if (!baseStage && (stage.blended || stage.dynamic)) {
+                                    definition.usesOverlay = true;
+                                }
+                                definition.dynamic = definition.dynamic || stage.dynamic;
+                            }
+                            if (!definition.tracedBase) {
+                                definition.usesOverlay = true;
+                            }
+                        }
+
+                        bool anyNonLightmapStage = false;
+                        bool allNonLightmapBlended = true;
+                        for (const ShaderStage &stage : currentStages) {
+                            if (stage.lightmap) {
+                                continue;
+                            }
+                            anyNonLightmapStage = true;
+                            if (!stage.blended) {
+                                allNonLightmapBlended = false;
+                                break;
+                            }
+                        }
+                        definition.hasOnlyBlendedStages = !definition.metallicEnvBase &&
+                            !definition.environmentMap && anyNonLightmapStage &&
+                            allNonLightmapBlended;
+
                         if (overrideExisting) {
                             shaderDefinitions[NormalizeShaderName(currentName)] = std::move(definition);
                         } else {
@@ -1813,6 +1997,7 @@ void LoadShaderScripts()
                     _stricmp(tokens[index + 1].c_str(), "environment") == 0) {
                     stageHasEnvironment = true;
                     currentStage.environmentMap = true;
+                    ++index;
                 } else if (_stricmp(token.c_str(), "blendFunc") == 0 && argsAvailable(index, 1)) {
                     const std::string &first = tokens[index + 1];
                     // blendFunc either takes a factor pair (GL_ONE GL_ONE) or a single
@@ -1957,30 +2142,71 @@ void LoadShaderScripts()
                 } else if ((_stricmp(token.c_str(), "rgbGen") == 0 ||
                     _stricmp(token.c_str(), "alphaGen") == 0) &&
                     index + 1 < tokens.size() &&
-                    _stricmp(tokens[index + 1].c_str(), "wave") == 0 &&
-                    argsAvailable(index, 6)) {
-                    const ShaderWaveType wave = ParseShaderWave(tokens[index + 2]);
-                    if (wave != SHADER_WAVE_NONE) {
-                        const bool alpha = _stricmp(token.c_str(), "alphaGen") == 0;
-                        ShaderWaveType &destination = alpha ? currentStage.alphaWave
-                                                           : currentStage.rgbWave;
-                        float &base = alpha ? currentStage.alphaWaveBase
-                                            : currentStage.rgbWaveBase;
-                        float &amplitude = alpha ? currentStage.alphaWaveAmplitude
-                                                 : currentStage.rgbWaveAmplitude;
-                        float &phase = alpha ? currentStage.alphaWavePhase
-                                             : currentStage.rgbWavePhase;
-                        float &frequency = alpha ? currentStage.alphaWaveFrequency
-                                                 : currentStage.rgbWaveFrequency;
-                        destination = wave;
-                        base = static_cast<float>(std::atof(tokens[index + 3].c_str()));
-                        amplitude = static_cast<float>(std::atof(tokens[index + 4].c_str()));
-                        phase = static_cast<float>(std::atof(tokens[index + 5].c_str()));
-                        frequency = static_cast<float>(std::atof(tokens[index + 6].c_str()));
-                        currentStage.dynamic = true;
-                        currentStage.animated = true;
+                    tokens[index + 1] != "{" && tokens[index + 1] != "}") {
+                    const bool isAlpha = _stricmp(token.c_str(), "alphaGen") == 0;
+                    const std::string &mode = tokens[index + 1];
+                    if (_stricmp(mode.c_str(), "wave") == 0 && argsAvailable(index, 6)) {
+                        const ShaderWaveType wave = ParseShaderWave(tokens[index + 2]);
+                        if (wave != SHADER_WAVE_NONE) {
+                            ShaderWaveType &destination = isAlpha ? currentStage.alphaWave
+                                                                  : currentStage.rgbWave;
+                            float &base = isAlpha ? currentStage.alphaWaveBase
+                                                  : currentStage.rgbWaveBase;
+                            float &amplitude = isAlpha ? currentStage.alphaWaveAmplitude
+                                                       : currentStage.rgbWaveAmplitude;
+                            float &phase = isAlpha ? currentStage.alphaWavePhase
+                                                   : currentStage.rgbWavePhase;
+                            float &frequency = isAlpha ? currentStage.alphaWaveFrequency
+                                                       : currentStage.rgbWaveFrequency;
+                            destination = wave;
+                            base = static_cast<float>(std::atof(tokens[index + 3].c_str()));
+                            amplitude = static_cast<float>(std::atof(tokens[index + 4].c_str()));
+                            phase = static_cast<float>(std::atof(tokens[index + 5].c_str()));
+                            frequency = static_cast<float>(std::atof(tokens[index + 6].c_str()));
+                            if (isAlpha) {
+                                currentStage.alphaGen = ALPHAGEN_WAVE;
+                            } else {
+                                currentStage.rgbGen = COLORGEN_WAVE;
+                            }
+                            currentStage.dynamic = true;
+                            currentStage.animated = true;
+                        }
+                        index += 6;
+                    } else if (!isAlpha && (_stricmp(mode.c_str(), "vertex") == 0 ||
+                                            _stricmp(mode.c_str(), "exactVertex") == 0)) {
+                        currentStage.rgbGen = COLORGEN_VERTEX;
+                        ++index;
+                    } else if (!isAlpha && _stricmp(mode.c_str(), "entity") == 0) {
+                        currentStage.rgbGen = COLORGEN_ENTITY;
+                        ++index;
+                    } else if (!isAlpha && (_stricmp(mode.c_str(), "identity") == 0 ||
+                                            _stricmp(mode.c_str(), "identityLighting") == 0 ||
+                                            _stricmp(mode.c_str(), "lightingDiffuse") == 0)) {
+                        currentStage.rgbGen = COLORGEN_IDENTITY;
+                        ++index;
+                    } else if (isAlpha && _stricmp(mode.c_str(), "vertex") == 0) {
+                        currentStage.alphaGen = ALPHAGEN_VERTEX;
+                        ++index;
+                    } else if (isAlpha && _stricmp(mode.c_str(), "entity") == 0) {
+                        currentStage.alphaGen = ALPHAGEN_ENTITY;
+                        ++index;
+                    } else if (isAlpha && _stricmp(mode.c_str(), "identity") == 0) {
+                        currentStage.alphaGen = ALPHAGEN_IDENTITY;
+                        ++index;
+                    } else if (_stricmp(mode.c_str(), "const") == 0) {
+                        size_t skip = index + 2;
+                        while (skip < tokens.size() && tokens[skip] != "}" &&
+                            tokens[skip] != "{" && !IsShaderStageKeyword(tokens[skip])) {
+                            if (tokens[skip].find(')') != std::string::npos) {
+                                ++skip;
+                                break;
+                            }
+                            ++skip;
+                        }
+                        index = skip - 1u;
+                    } else {
+                        ++index;
                     }
-                    index += 6;
                 }
             }
         }
@@ -2089,6 +2315,8 @@ QrMaterial GetMaterialForTextureNameInternal(const char *name, bool rawTexture)
     const char *textureName = shaderIt != shaderDefinitions.end() ? shaderIt->second.map.c_str() : name;
     const bool darkenDecal = !rawTexture && shaderIt != shaderDefinitions.end() &&
         shaderIt->second.darkenDecal;
+    const bool metallicEnvBase = !rawTexture && shaderIt != shaderDefinitions.end() &&
+        shaderIt->second.metallicEnvBase;
     int width = 0;
     int height = 0;
     std::vector<uint8_t> albedo;
@@ -2101,10 +2329,10 @@ QrMaterial GetMaterialForTextureNameInternal(const char *name, bool rawTexture)
         if (!rawTexture && shaderIt != shaderDefinitions.end() &&
             BuildSurfaceLightEmission(shaderIt->second, width, height, albedo, emission)) {
             material = CreateMaterialFromPixels(textureName, width, height, albedo,
-                QR_SAMPLER_ADDRESS_MODE_REPEAT, &emission);
+                QR_SAMPLER_ADDRESS_MODE_REPEAT, &emission, metallicEnvBase);
         } else {
             material = CreateMaterialFromPixels(textureName, width, height, albedo,
-                QR_SAMPLER_ADDRESS_MODE_REPEAT);
+                QR_SAMPLER_ADDRESS_MODE_REPEAT, nullptr, metallicEnvBase);
         }
     }
     if (material == QR_NO_MATERIAL) {
@@ -2132,7 +2360,8 @@ QrMaterial GetRawMaterialForTextureName(const char *name)
 
 // Loads a specific stage texture directly without redirecting through shaderDefinitions[name].map
 // (which points to stage 0 when a stage image shares the parent shader's name, e.g. skullarch_b.tga).
-QrMaterial GetDirectImageMaterial(const char *imageName, QrSamplerAddressMode addressMode, bool emissive = false)
+QrMaterial GetDirectImageMaterial(const char *imageName, QrSamplerAddressMode addressMode,
+    bool emissive = false, bool cleanAdditiveBlack = false)
 {
     if (imageName == nullptr || imageName[0] == '\0') {
         return defaultMaterial;
@@ -2142,6 +2371,9 @@ QrMaterial GetDirectImageMaterial(const char *imageName, QrSamplerAddressMode ad
     key += (addressMode == QR_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE) ? "|clamp" : "|repeat";
     if (emissive) {
         key += "|em";
+    }
+    if (cleanAdditiveBlack) {
+        key += "|addclean";
     }
     const auto existing = directImageMaterials.find(key);
     if (existing != directImageMaterials.end()) {
@@ -2153,6 +2385,9 @@ QrMaterial GetDirectImageMaterial(const char *imageName, QrSamplerAddressMode ad
     std::vector<uint8_t> albedo;
     QrMaterial material = QR_NO_MATERIAL;
     if (LoadQ3Texture(imageName, width, height, albedo)) {
+        if (cleanAdditiveBlack) {
+            CleanAdditiveBlackBackground(albedo);
+        }
         if (emissive && width > 0 && height > 0) {
             const size_t pixelCount = static_cast<size_t>(width) * height;
             std::vector<uint8_t> emission(pixelCount, 0);
@@ -2473,6 +2708,7 @@ void ResetMaterialState()
     shaderMaterialAttempted.clear();
     defaultMaterial = QR_NO_MATERIAL;
     skyAtlasMaterial = QR_NO_MATERIAL;
+    cutoutBackingMaterial = QR_NO_MATERIAL;
     skyAtlasAttempted = false;
     skyAtlasFaceSize = 0;
     worldClusters.uploaded = false;
@@ -4528,6 +4764,48 @@ void BuildSkyEnvironment()
         skyAverageColor[0], skyAverageColor[1], skyAverageColor[2]);
 }
 
+void OffsetVerticesAlongSmoothNormals(std::vector<QrVertex> &vertices,
+    const std::vector<uint32_t> &indices, float offset)
+{
+    if (offset == 0.0f || vertices.empty() || indices.size() < 3) {
+        return;
+    }
+    std::vector<float> accumNormals(vertices.size() * 3, 0.0f);
+    for (size_t i = 0; i + 2 < indices.size(); i += 3) {
+        const uint32_t i0 = indices[i + 0];
+        const uint32_t i1 = indices[i + 1];
+        const uint32_t i2 = indices[i + 2];
+        if (i0 >= vertices.size() || i1 >= vertices.size() || i2 >= vertices.size()) {
+            continue;
+        }
+        const float *p0 = vertices[i0].position;
+        const float *p1 = vertices[i1].position;
+        const float *p2 = vertices[i2].position;
+        const float e1[3] = {p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]};
+        const float e2[3] = {p2[0] - p0[0], p2[1] - p0[1], p2[2] - p0[2]};
+        const float n[3] = {
+            e1[1] * e2[2] - e1[2] * e2[1],
+            e1[2] * e2[0] - e1[0] * e2[2],
+            e1[0] * e2[1] - e1[1] * e2[0],
+        };
+        for (uint32_t vi : {i0, i1, i2}) {
+            accumNormals[vi * 3 + 0] += n[0];
+            accumNormals[vi * 3 + 1] += n[1];
+            accumNormals[vi * 3 + 2] += n[2];
+        }
+    }
+    for (size_t vi = 0; vi < vertices.size(); ++vi) {
+        float *n = &accumNormals[vi * 3];
+        const float len = std::sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+        if (len > 1e-6f) {
+            const float scale = offset / len;
+            vertices[vi].position[0] += n[0] * scale;
+            vertices[vi].position[1] += n[1] * scale;
+            vertices[vi].position[2] += n[2] * scale;
+        }
+    }
+}
+
 void BuildMarkAcceleration(const std::vector<GeometryBatch> &batches)
 {
     markTriangles.clear();
@@ -4896,6 +5174,10 @@ bool LoadBspGeometryInner(const char *name)
 
                         GeometryBatch &batch = batches[static_cast<size_t>(surface.shaderNum)];
                         batch.material = material;
+                        const bool surfaceAlphaTested = qrayAlphaTest != nullptr && qrayAlphaTest->integer != 0
+                            && ShaderUsesAlphaTest(shader.shader);
+                        surfaceInfo.alphaTested = surfaceAlphaTested;
+                        batch.alphaTested = batch.alphaTested || surfaceAlphaTested;
                         const uint32_t baseVertex = static_cast<uint32_t>(batch.vertices.size());
                         batch.vertices.insert(batch.vertices.end(), patchVerts.begin(), patchVerts.end());
                         batch.sourceSurfaceIndices.insert(batch.sourceSurfaceIndices.end(), patchVerts.size(),
@@ -5103,60 +5385,31 @@ bool LoadBspGeometryInner(const char *name)
                         worldShaderNames[static_cast<size_t>(batchIndex)];
                     const auto shaderDefinitionIt =
                         shaderDefinitions.find(NormalizeShaderName(batchShaderName));
+                    const bool isCutoutUnderlay = shaderDefinitionIt != shaderDefinitions.end() &&
+                        shaderDefinitionIt->second.cutoutFrameUnderlay;
                     if (shaderDefinitionIt != shaderDefinitions.end() &&
                         shaderDefinitionIt->second.usesOverlay) {
                         WorldOverlayBatch overlay;
                         overlay.shaderName = batchShaderName;
                         overlay.vertices = batch.vertices;
                         overlay.indices = batch.indices;
-                        if (shaderDefinitionIt->second.tracedBase) {
+                        overlay.cutoutUnderlay = isCutoutUnderlay;
+                        if (isCutoutUnderlay) {
+                            // Push the animated under-layer behind the raytraced alpha-tested
+                            // frame so it renders strictly inside the cutout opening via DEPTH_TEST.
+                            OffsetVerticesAlongSmoothNormals(overlay.vertices, overlay.indices, -0.35f);
+                        } else if (shaderDefinitionIt->second.tracedBase) {
                             // Push overlay layers slightly along the surface normal so they clear
                             // the ray-traced base depth buffer without Z-fighting (including patches,
                             // whose batch vertices carry placeholder (0,0,1) normals).
-                            const float offset = CvarFloat(qrayDecalOffset, 0.25f);
-                            if (offset != 0.0f) {
-                                std::vector<float> accumNormals(overlay.vertices.size() * 3, 0.0f);
-                                for (size_t i = 0; i + 2 < overlay.indices.size(); i += 3) {
-                                    const uint32_t i0 = overlay.indices[i + 0];
-                                    const uint32_t i1 = overlay.indices[i + 1];
-                                    const uint32_t i2 = overlay.indices[i + 2];
-                                    if (i0 >= overlay.vertices.size() || i1 >= overlay.vertices.size() ||
-                                        i2 >= overlay.vertices.size()) {
-                                        continue;
-                                    }
-                                    const float *p0 = overlay.vertices[i0].position;
-                                    const float *p1 = overlay.vertices[i1].position;
-                                    const float *p2 = overlay.vertices[i2].position;
-                                    const float e1[3] = {p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]};
-                                    const float e2[3] = {p2[0] - p0[0], p2[1] - p0[1], p2[2] - p0[2]};
-                                    const float n[3] = {
-                                        e1[1] * e2[2] - e1[2] * e2[1],
-                                        e1[2] * e2[0] - e1[0] * e2[2],
-                                        e1[0] * e2[1] - e1[1] * e2[0],
-                                    };
-                                    for (uint32_t vi : {i0, i1, i2}) {
-                                        accumNormals[vi * 3 + 0] += n[0];
-                                        accumNormals[vi * 3 + 1] += n[1];
-                                        accumNormals[vi * 3 + 2] += n[2];
-                                    }
-                                }
-                                for (size_t vi = 0; vi < overlay.vertices.size(); ++vi) {
-                                    float *n = &accumNormals[vi * 3];
-                                    const float len = std::sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
-                                    if (len > 1e-6f) {
-                                        const float scale = offset / len;
-                                        overlay.vertices[vi].position[0] += n[0] * scale;
-                                        overlay.vertices[vi].position[1] += n[1] * scale;
-                                        overlay.vertices[vi].position[2] += n[2] * scale;
-                                    }
-                                }
-                            }
+                            OffsetVerticesAlongSmoothNormals(overlay.vertices, overlay.indices,
+                                CvarFloat(qrayDecalOffset, 0.25f));
                         }
                         worldOverlayBatches.push_back(std::move(overlay));
                         ++overlayBatches;
-                        HostLog("LoadBspGeometry: overlay shader='%s' stages=%zu tracedBase=%d",
+                        HostLog("LoadBspGeometry: overlay shader='%s' stages=%zu tracedBase=%d cutout=%d",
                             batchShaderName.c_str(), shaderDefinitionIt->second.stages.size(),
-                            shaderDefinitionIt->second.tracedBase ? 1 : 0);
+                            shaderDefinitionIt->second.tracedBase ? 1 : 0, isCutoutUnderlay ? 1 : 0);
                         if (!shaderDefinitionIt->second.tracedBase) {
                             continue;
                         }
@@ -5196,6 +5449,19 @@ bool LoadBspGeometryInner(const char *name)
                         }
                     } else {
                         HostLog("LoadBspGeometry: batch %zu upload failed result=%d", batchIndex, static_cast<int>(uploadResult));
+                    }
+
+                    if (isCutoutUnderlay) {
+                        std::vector<QrVertex> backingVertices = batch.vertices;
+                        OffsetVerticesAlongSmoothNormals(backingVertices, batch.indices, -0.75f);
+                        const std::vector<QrVertex> meterBacking = QuakeVerticesToMeters(backingVertices);
+                        QrGeometryUploadInfo backingUpload = upload;
+                        backingUpload.uniqueID = 0x100000000ull + static_cast<uint64_t>(batchIndex) + 1;
+                        backingUpload.passThroughType = QR_GEOMETRY_PASS_THROUGH_TYPE_OPAQUE;
+                        backingUpload.vertexCount = static_cast<uint32_t>(meterBacking.size());
+                        backingUpload.pVertices = meterBacking.data();
+                        backingUpload.geomMaterial.layerMaterials[0] = GetCutoutBackingMaterial();
+                        qrUploadGeometry(qrayInstance, &backingUpload);
                     }
                 }
                 FinalizeSurfaceEmitters();
@@ -5513,10 +5779,13 @@ void UploadDynamicGeometry(const std::vector<QrVertex> &vertices, const std::vec
 // upload passes no view projection, which makes the overlay use the frame's own camera matrices,
 // and keeps the GL blend equation of the shader so smoke, additive glows and darkening decals come
 // out the way the original renderer draws them.
+void ComputeModelEnvironmentTexCoord(const float position[3], const float normal[3], float out[2]);
+
 void UploadRasterizedWorldGeometry(const std::vector<QrVertex> &vertices,
     const std::vector<uint32_t> &indices, QrMaterial material, QrBlendFactor blendSource,
     QrBlendFactor blendDestination, uint32_t pipelineStateOverride = 0xFFFFFFFFu,
-    const float texCoordOffset[2] = nullptr, const float color[4] = nullptr)
+    const float texCoordOffset[2] = nullptr, const float color[4] = nullptr,
+    const float smokeLook[4] = nullptr)
 {
     if (qrayInstance == QR_NULL_HANDLE || vertices.empty() || !frameStarted) {
         return;
@@ -5537,6 +5806,12 @@ void UploadRasterizedWorldGeometry(const std::vector<QrVertex> &vertices,
     info.color.data[1] = color != nullptr ? color[1] : 1.0f;
     info.color.data[2] = color != nullptr ? color[2] : 1.0f;
     info.color.data[3] = color != nullptr ? color[3] : 1.0f;
+    if (smokeLook != nullptr) {
+        info.smokeLook.data[0] = smokeLook[0];
+        info.smokeLook.data[1] = smokeLook[1];
+        info.smokeLook.data[2] = smokeLook[2];
+        info.smokeLook.data[3] = smokeLook[3];
+    }
     info.texCoordScale[0] = 1.0f;
     info.texCoordScale[1] = 1.0f;
     info.texCoordOffset[0] = texCoordOffset != nullptr ? texCoordOffset[0] : 0.0f;
@@ -5642,23 +5917,19 @@ void UploadWorldOverlayGeometry()
         }
 
         const ShaderDefinition &definition = definitionIt->second;
-        const size_t firstOverlayStage = definition.tracedBase &&
-            definition.baseStageIndex < definition.stages.size()
-            ? definition.baseStageIndex + 1u
-            : 0u;
+        size_t firstOverlayStage = 0u;
+        size_t endOverlayStage = definition.stages.size();
+        if (batch.cutoutUnderlay && definition.baseStageIndex < definition.stages.size()) {
+            firstOverlayStage = 0u;
+            endOverlayStage = definition.baseStageIndex;
+        } else if (definition.tracedBase && definition.baseStageIndex < definition.stages.size()) {
+            firstOverlayStage = definition.baseStageIndex + 1u;
+        }
         for (size_t stageIndex = firstOverlayStage;
-             stageIndex < definition.stages.size(); ++stageIndex) {
+             stageIndex < endOverlayStage; ++stageIndex) {
             const ShaderStage &stage = definition.stages[stageIndex];
             const std::string textureName = ActiveStageTexture(stage, timeSeconds);
             if (textureName.empty() || _stricmp(textureName.c_str(), "$lightmap") == 0) {
-                continue;
-            }
-
-            const QrSamplerAddressMode addressMode = stage.clampMap
-                ? QR_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE
-                : QR_SAMPLER_ADDRESS_MODE_REPEAT;
-            const QrMaterial material = GetDirectImageMaterial(textureName.c_str(), addressMode, false);
-            if (material == QR_NO_MATERIAL) {
                 continue;
             }
 
@@ -5668,7 +5939,9 @@ void UploadWorldOverlayGeometry()
             if (stage.blended || stage.blend != QR_GEOMETRY_MATERIAL_BLEND_TYPE_OPAQUE) {
                 state |= QR_RASTERIZED_GEOMETRY_STATE_BLEND_ENABLE;
             } else {
-                state |= QR_RASTERIZED_GEOMETRY_STATE_DEPTH_WRITE;
+                if (!batch.cutoutUnderlay) {
+                    state |= QR_RASTERIZED_GEOMETRY_STATE_DEPTH_WRITE;
+                }
                 source = QR_BLEND_FACTOR_ONE;
                 destination = QR_BLEND_FACTOR_ZERO;
             }
@@ -5682,7 +5955,8 @@ void UploadWorldOverlayGeometry()
                 stage.alphaWaveAmplitude, stage.alphaWavePhase, stage.alphaWaveFrequency,
                 timeSeconds);
             const bool isAdditive = (stage.blend == QR_GEOMETRY_MATERIAL_BLEND_TYPE_ADD) ||
-                (source == QR_BLEND_FACTOR_ONE && destination == QR_BLEND_FACTOR_ONE);
+                (source == QR_BLEND_FACTOR_ONE && destination == QR_BLEND_FACTOR_ONE) ||
+                (source == QR_BLEND_FACTOR_SRC_ALPHA && destination == QR_BLEND_FACTOR_ONE);
             const bool isFilterOrDarken =
                 (source == QR_BLEND_FACTOR_DST_COLOR) ||
                 (source == QR_BLEND_FACTOR_ONE_MINUS_DST_COLOR) ||
@@ -5691,19 +5965,38 @@ void UploadWorldOverlayGeometry()
             const bool isSelfLitOpaque = !stage.blended &&
                 stage.blend == QR_GEOMETRY_MATERIAL_BLEND_TYPE_OPAQUE &&
                 definition.surfaceLight > 0.0f;
+
+            const QrSamplerAddressMode addressMode = stage.clampMap
+                ? QR_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE
+                : QR_SAMPLER_ADDRESS_MODE_REPEAT;
+            const QrMaterial material = GetDirectImageMaterial(textureName.c_str(), addressMode, false,
+                isAdditive);
+            if (material == QR_NO_MATERIAL) {
+                continue;
+            }
+
             float gain = 1.0f;
-            if (isAdditive) {
-                gain = std::max(0.0f, CvarFloat(qrayOverlayAddScale, 24.0f));
+            if (isAdditive || isSelfLitOpaque) {
+                gain = std::max(0.0f, CvarFloat(qrayOverlayAddScale, 1.5f));
             } else if (isFilterOrDarken) {
                 gain = 1.0f;
-            } else if (isSelfLitOpaque) {
-                gain = std::max(std::max(0.0f, CvarFloat(qrayOverlayScale, 2.0f)),
-                    std::max(0.0f, CvarFloat(qrayOverlayAddScale, 24.0f)) * 0.5f);
             } else {
-                gain = std::max(0.0f, CvarFloat(qrayOverlayScale, 2.0f));
+                gain = std::max(0.0f, CvarFloat(qrayOverlayScale, 1.0f));
             }
             const float color[4] = {rgb * gain, rgb * gain, rgb * gain, alpha};
-            if (!stage.tcMods.empty()) {
+            if (stage.environmentMap) {
+                transformedVertices = batch.vertices;
+                for (QrVertex &v : transformedVertices) {
+                    ComputeModelEnvironmentTexCoord(v.position, v.normal, v.texCoord);
+                }
+                if (!stage.tcMods.empty()) {
+                    static std::vector<QrVertex> envModVertices;
+                    ApplyStageTcMods(stage, timeSeconds, transformedVertices, envModVertices);
+                    transformedVertices.swap(envModVertices);
+                }
+                UploadRasterizedWorldGeometry(transformedVertices, batch.indices, material,
+                    source, destination, state, nullptr, color);
+            } else if (!stage.tcMods.empty()) {
                 ApplyStageTcMods(stage, timeSeconds, batch.vertices, transformedVertices);
                 UploadRasterizedWorldGeometry(transformedVertices, batch.indices, material,
                     source, destination, state, nullptr, color);
@@ -5894,7 +6187,103 @@ void ComputeModelEnvironmentTexCoord(const float position[3], const float normal
     out[1] = 0.5f - eyeY / denominator;
 }
 
-void UploadModelEntity(const refEntity_t &entity)
+void UploadShaderEffectStages(const ShaderDefinition &definition,
+    const std::vector<QrVertex> &baseVertices, const std::vector<uint32_t> &indices,
+    const color4ub_t &entityColor, float shaderTimeSeconds, bool allowLitParticle,
+    size_t skipStageIndex = static_cast<size_t>(-1))
+{
+    if (baseVertices.empty() || indices.empty()) {
+        return;
+    }
+    const float sceneTimeSeconds = static_cast<float>(sceneDef.time) * 0.001f;
+    const float stageTime = std::max(0.0f, sceneTimeSeconds - shaderTimeSeconds);
+    static std::vector<QrVertex> stageVertices;
+    static std::vector<QrVertex> modVertices;
+
+    for (size_t stageIndex = 0; stageIndex < definition.stages.size(); ++stageIndex) {
+        if (stageIndex == skipStageIndex) {
+            continue;
+        }
+        const ShaderStage &stage = definition.stages[stageIndex];
+        if (stage.lightmap) {
+            continue;
+        }
+        const std::string textureName = ActiveStageTexture(stage, stageTime);
+        if (textureName.empty() || _stricmp(textureName.c_str(), "$lightmap") == 0) {
+            continue;
+        }
+        QrBlendFactor source = stage.blendSrc;
+        QrBlendFactor destination = stage.blendDst;
+        uint32_t state = QR_RASTERIZED_GEOMETRY_STATE_DEPTH_TEST;
+        if (stage.blended || stage.blend != QR_GEOMETRY_MATERIAL_BLEND_TYPE_OPAQUE) {
+            state |= QR_RASTERIZED_GEOMETRY_STATE_BLEND_ENABLE;
+        } else {
+            state |= QR_RASTERIZED_GEOMETRY_STATE_DEPTH_WRITE;
+            source = QR_BLEND_FACTOR_ONE;
+            destination = QR_BLEND_FACTOR_ZERO;
+        }
+        if (stage.alphaTested) {
+            state |= QR_RASTERIZED_GEOMETRY_STATE_ALPHA_TEST;
+        }
+        const bool isAdditive = (stage.blend == QR_GEOMETRY_MATERIAL_BLEND_TYPE_ADD) ||
+            (source == QR_BLEND_FACTOR_ONE && destination == QR_BLEND_FACTOR_ONE) ||
+            (source == QR_BLEND_FACTOR_SRC_ALPHA && destination == QR_BLEND_FACTOR_ONE);
+        if (isAdditive && NormalizeShaderName(textureName) == "gfx/colors/black") {
+            continue;
+        }
+
+        const QrSamplerAddressMode addressMode = stage.clampMap
+            ? QR_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE
+            : QR_SAMPLER_ADDRESS_MODE_REPEAT;
+        const QrMaterial material = GetDirectImageMaterial(textureName.c_str(), addressMode, false,
+            isAdditive);
+        if (material == QR_NO_MATERIAL) {
+            continue;
+        }
+
+        stageVertices = baseVertices;
+        if (stage.environmentMap) {
+            for (QrVertex &v : stageVertices) {
+                ComputeModelEnvironmentTexCoord(v.position, v.normal, v.texCoord);
+            }
+        }
+        if (!stage.tcMods.empty()) {
+            ApplyStageTcMods(stage, stageTime, stageVertices, modVertices);
+            stageVertices.swap(modVertices);
+        }
+
+        const bool useEntityRgb = stage.rgbGen == COLORGEN_ENTITY || stage.rgbGen == COLORGEN_VERTEX;
+        const bool useEntityAlpha = stage.alphaGen == ALPHAGEN_ENTITY || stage.alphaGen == ALPHAGEN_VERTEX;
+        color4ub_t stageColor{};
+        stageColor.rgba[0] = useEntityRgb ? entityColor.rgba[0] : 255;
+        stageColor.rgba[1] = useEntityRgb ? entityColor.rgba[1] : 255;
+        stageColor.rgba[2] = useEntityRgb ? entityColor.rgba[2] : 255;
+        stageColor.rgba[3] = useEntityAlpha ? entityColor.rgba[3] : 255;
+        const uint32_t packedColor = PackColor(stageColor);
+        for (QrVertex &v : stageVertices) {
+            v.packedColor = packedColor;
+        }
+
+        const float rgbWave = EvaluateShaderWave(stage.rgbWave, stage.rgbWaveBase,
+            stage.rgbWaveAmplitude, stage.rgbWavePhase, stage.rgbWaveFrequency, stageTime);
+        const float alphaWave = EvaluateShaderWave(stage.alphaWave, stage.alphaWaveBase,
+            stage.alphaWaveAmplitude, stage.alphaWavePhase, stage.alphaWaveFrequency, stageTime);
+        const float gain = isAdditive ? std::max(0.0f, CvarFloat(qrayOverlayAddScale, 1.5f)) : 1.0f;
+        const float color[4] = {rgbWave * gain, rgbWave * gain, rgbWave * gain, alphaWave};
+
+        const bool useLitParticle = allowLitParticle && !isAdditive && !stage.alphaTested &&
+            source == QR_BLEND_FACTOR_SRC_ALPHA &&
+            destination == QR_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+        const float smokeLook[4] = {0.0f, 0.35f, 1.0f, 0.015f};
+        if (useLitParticle) {
+            state |= QR_RASTERIZED_GEOMETRY_STATE_PARTICLE;
+        }
+        UploadRasterizedWorldGeometry(stageVertices, indices, material, source, destination,
+            state, nullptr, color, useLitParticle ? smokeLook : nullptr);
+    }
+}
+
+void UploadModelEntity(const refEntity_t &entity, float shaderTimeSeconds)
 {
     const auto modelIt = modelAssets.find(entity.hModel);
     if (modelIt == modelAssets.end() || !modelIt->second.valid) {
@@ -5913,10 +6302,23 @@ void UploadModelEntity(const refEntity_t &entity)
     const float backLerp = frame == oldFrame ? 0.0f : std::clamp(entity.backlerp, 0.0f, 1.0f);
     const float frontLerp = 1.0f - backLerp;
 
+    LoadShaderScripts();
+    const char *customShaderName = entity.customShader != 0
+        ? ShaderNameForHandle(entity.customShader)
+        : nullptr;
+
     for (const ModelSurface &surface : asset.surfaces) {
         if (surface.numVerts <= 0 || surface.indices.empty()) {
             continue;
         }
+        const char *activeShaderName = (customShaderName != nullptr && customShaderName[0] != '\0')
+            ? customShaderName
+            : ResolveModelShaderName(entity, surface);
+        const auto definitionIt = shaderDefinitions.find(NormalizeShaderName(activeShaderName));
+        const ShaderDefinition *definition = definitionIt != shaderDefinitions.end()
+            ? &definitionIt->second
+            : nullptr;
+
         // tcGen environment surfaces have no usable UVs, so the texcoords are always rebuilt from
         // the eye reflection vector. The authored blend factors decide how the stage is drawn.
         // one/zero replaces the surface, so it is the pickup body itself and has to be traced like
@@ -5927,24 +6329,19 @@ void UploadModelEntity(const refEntity_t &entity)
         QrBlendFactor environmentDestination = QR_BLEND_FACTOR_ZERO;
         QrMaterial environmentMaterial = QR_NO_MATERIAL;
         std::string environmentDefinitionMap;
-        if (entity.customShader == 0) {
-            const char *shaderName = ResolveModelShaderName(entity, surface);
-            LoadShaderScripts();
-            const auto definitionIt = shaderDefinitions.find(NormalizeShaderName(shaderName));
-            if (definitionIt != shaderDefinitions.end() && definitionIt->second.environmentMap) {
-                environmentMapped = true;
-                environmentSource = definitionIt->second.blendSrc;
-                environmentDestination = definitionIt->second.blendDst;
-                environmentMaterial = GetMaterialForTextureName(definitionIt->second.map.c_str());
-                environmentDefinitionMap = definitionIt->second.map;
-                if (hostLogEnabled) {
-                    static std::unordered_set<std::string> loggedEnvironmentShaders;
-                    if (loggedEnvironmentShaders.insert(definitionIt->first).second) {
-                        HostLog("UploadModelEntity: env stage %s map=%s src=%d dst=%d",
-                            definitionIt->first.c_str(), definitionIt->second.map.c_str(),
-                            static_cast<int>(environmentSource),
-                            static_cast<int>(environmentDestination));
-                    }
+        if (definition != nullptr && definition->environmentMap) {
+            environmentMapped = true;
+            environmentSource = definition->blendSrc;
+            environmentDestination = definition->blendDst;
+            environmentMaterial = GetMaterialForTextureName(definition->map.c_str());
+            environmentDefinitionMap = definition->map;
+            if (hostLogEnabled) {
+                static std::unordered_set<std::string> loggedEnvironmentShaders;
+                if (loggedEnvironmentShaders.insert(definitionIt->first).second) {
+                    HostLog("UploadModelEntity: env stage %s map=%s src=%d dst=%d",
+                        definitionIt->first.c_str(), definition->map.c_str(),
+                        static_cast<int>(environmentSource),
+                        static_cast<int>(environmentDestination));
                 }
             }
         }
@@ -6002,15 +6399,20 @@ void UploadModelEntity(const refEntity_t &entity)
             destination.cluster = entityCluster;
         }
 
-        const QrMaterial material = environmentMaterial != QR_NO_MATERIAL
-            ? environmentMaterial
-            : ResolveModelMaterial(entity, asset, surface);
         std::vector<uint32_t> indices = surface.indices;
         if (qrayModelWinding != nullptr && qrayModelWinding->integer != 0) {
             for (size_t index = 0; index + 2 < indices.size(); index += 3) {
                 std::swap(indices[index + 1], indices[index + 2]);
             }
         }
+        if (definition != nullptr && definition->hasOnlyBlendedStages) {
+            UploadShaderEffectStages(*definition, vertices, indices, entity.shader,
+                shaderTimeSeconds, false);
+            continue;
+        }
+        const QrMaterial material = environmentMaterial != QR_NO_MATERIAL
+            ? environmentMaterial
+            : ResolveModelMaterial(entity, asset, surface);
         if (environmentMapped) {
             const bool additiveEnvironment = environmentSource != QR_BLEND_FACTOR_ONE ||
                 environmentDestination != QR_BLEND_FACTOR_ZERO;
@@ -6050,10 +6452,15 @@ void UploadModelEntity(const refEntity_t &entity)
         }
         UploadDynamicGeometry(vertices, indices, material, visibility,
             QR_GEOMETRY_PASS_THROUGH_TYPE_OPAQUE, QR_GEOMETRY_MATERIAL_BLEND_TYPE_OPAQUE, 0.0f);
+        if (definition != nullptr && definition->usesOverlay && definition->tracedBase &&
+            !definition->cutoutFrameUnderlay) {
+            UploadShaderEffectStages(*definition, vertices, indices, entity.shader,
+                shaderTimeSeconds, false, definition->baseStageIndex);
+        }
     }
 }
 
-void UploadSpriteEntity(const refEntity_t &entity)
+void UploadSpriteEntity(const refEntity_t &entity, float shaderTimeSeconds)
 {
     const float radius = entity.radius;
     if (radius <= 0.0f) {
@@ -6079,6 +6486,16 @@ void UploadSpriteEntity(const refEntity_t &entity)
         }
     }
 
+    color4ub_t fallbackColor = entity.shader;
+    if (fallbackColor.rgba[0] == 0 && fallbackColor.rgba[1] == 0 && fallbackColor.rgba[2] == 0) {
+        fallbackColor.rgba[0] = 255;
+        fallbackColor.rgba[1] = 255;
+        fallbackColor.rgba[2] = 255;
+    }
+    if (fallbackColor.rgba[3] == 0) {
+        fallbackColor.rgba[3] = 255;
+    }
+
     const float cornerOffsets[4][2] = {{-1.0f, -1.0f}, {1.0f, -1.0f}, {1.0f, 1.0f}, {-1.0f, 1.0f}};
     const float textureCoords[4][2] = {{0.0f, 1.0f}, {1.0f, 1.0f}, {1.0f, 0.0f}, {0.0f, 0.0f}};
     const uint32_t spriteCluster = ClusterIndexForPoint(entity.origin);
@@ -6093,18 +6510,25 @@ void UploadSpriteEntity(const refEntity_t &entity)
         }
         vertex.texCoord[0] = textureCoords[corner][0];
         vertex.texCoord[1] = textureCoords[corner][1];
-        vertex.packedColor = PackColor(entity.shader);
+        vertex.packedColor = PackColor(fallbackColor);
         vertex.cluster = spriteCluster;
     }
 
     std::vector<uint32_t> indices = {0, 1, 2, 0, 2, 3};
+    LoadShaderScripts();
+    const char *shaderName = ShaderNameForHandle(entity.customShader);
+    const auto definitionIt = shaderDefinitions.find(NormalizeShaderName(shaderName));
+    if (definitionIt != shaderDefinitions.end() && !definitionIt->second.stages.empty()) {
+        UploadShaderEffectStages(definitionIt->second, vertices, indices, entity.shader,
+            shaderTimeSeconds, true);
+        return;
+    }
+
     const QrGeometryPrimaryVisibilityType visibility =
         (entity.renderfx & (RF_FIRST_PERSON | RF_DEPTHHACK)) != 0
         ? QR_GEOMETRY_VISIBILITY_TYPE_FIRST_PERSON
         : QR_GEOMETRY_VISIBILITY_TYPE_WORLD_0;
-    const float layerAlpha = entity.shader.rgba[3] != 0
-        ? static_cast<float>(entity.shader.rgba[3]) / 255.0f
-        : 1.0f;
+    const float layerAlpha = static_cast<float>(fallbackColor.rgba[3]) / 255.0f;
     const QrGeometryMaterialBlendType blend = EffectBlendForHandle(entity.customShader);
     const QrMaterial material = GetMaterialForHandle(entity.customShader);
     QrBlendFactor blendSource = QR_BLEND_FACTOR_ONE;
@@ -6161,6 +6585,16 @@ void UploadBeamEntity(const refEntity_t &entity)
         side[axis] *= width;
     }
 
+    color4ub_t fallbackColor = entity.shader;
+    if (fallbackColor.rgba[0] == 0 && fallbackColor.rgba[1] == 0 && fallbackColor.rgba[2] == 0) {
+        fallbackColor.rgba[0] = 255;
+        fallbackColor.rgba[1] = 255;
+        fallbackColor.rgba[2] = 255;
+    }
+    if (fallbackColor.rgba[3] == 0) {
+        fallbackColor.rgba[3] = 255;
+    }
+
     std::vector<QrVertex> vertices(4);
     const uint32_t beamCluster = ClusterIndexForPoint(entity.origin);
     const float *positions[4] = {
@@ -6178,7 +6612,7 @@ void UploadBeamEntity(const refEntity_t &entity)
         }
         vertex.texCoord[0] = textureU[corner];
         vertex.texCoord[1] = textureV[corner];
-        vertex.packedColor = PackColor(entity.shader);
+        vertex.packedColor = PackColor(fallbackColor);
         vertex.cluster = beamCluster;
     }
 
@@ -6268,13 +6702,26 @@ void UploadPolyGeometry(const PendingPoly &poly)
     QrBlendFactor blendSource = QR_BLEND_FACTOR_ONE;
     QrBlendFactor blendDestination = QR_BLEND_FACTOR_ONE;
     const bool blended = EffectBlendFactorsForHandle(poly.shader, blendSource, blendDestination);
-    // GL_ZERO / GL_ONE_MINUS_SRC_COLOR darkens by the source colour, and Q3 keeps the vertex
-    // colour of a shadow blob opaque black while the brightness comes from the image. Feeding
-    // that vertex colour into the overlay darkens the surface to full black, so darken decals
-    // take the image instead.
+    const bool isEnergyMark =
+        NormalizeShaderName(ShaderNameForHandle(poly.shader)) == "gfx/damage/plasma_mrk";
+    if (isEnergyMark) {
+        blendSource = QR_BLEND_FACTOR_SRC_ALPHA;
+        blendDestination = QR_BLEND_FACTOR_ONE;
+    }
+    // Darken decals with rgbGen exactVertex should preserve their vertex color fade; only replace
+    // pure-black RGB with white when alpha > 0 (legacy shadow masks) or when rgbGen is identity.
     if (blend == QR_GEOMETRY_MATERIAL_BLEND_TYPE_SHADE) {
-        for (QrVertex &vertex : vertices) {
-            vertex.packedColor = 0xFFFFFFFFu;
+        LoadShaderScripts();
+        const auto polyDefIt = shaderDefinitions.find(
+            NormalizeShaderName(ShaderNameForHandle(poly.shader)));
+        const bool stageIdentity = polyDefIt != shaderDefinitions.end() &&
+            !polyDefIt->second.stages.empty() &&
+            polyDefIt->second.stages.front().rgbGen == COLORGEN_IDENTITY;
+        for (size_t vi = 0; vi < vertices.size(); ++vi) {
+            const color4ub_t &c = poly.verts[vi].modulate;
+            if (stageIdentity || (c.rgba[0] == 0 && c.rgba[1] == 0 && c.rgba[2] == 0 && c.rgba[3] > 0)) {
+                vertices[vi].packedColor = 0xFFFFFFFFu;
+            }
         }
     }
     // A darken decal is only dark once its real blend equation runs, so the blend-equation path
@@ -6400,7 +6847,13 @@ void UploadPolyGeometry(const PendingPoly &poly)
         return;
     }
     if (blended) {
-        UploadRasterizedWorldGeometry(vertices, indices, material, blendSource, blendDestination);
+        if (isEnergyMark) {
+            const float energyMarkColor[4] = {0.85f, 0.85f, 0.85f, 1.0f};
+            UploadRasterizedWorldGeometry(vertices, indices, material, blendSource, blendDestination,
+                0xFFFFFFFFu, nullptr, energyMarkColor);
+        } else {
+            UploadRasterizedWorldGeometry(vertices, indices, material, blendSource, blendDestination);
+        }
         return;
     }
     UploadDynamicGeometry(vertices, indices, material,
@@ -6559,7 +7012,8 @@ void UploadPendingSceneGeometry()
     {
         static uint64_t uploadFrameCounter = 0;
         int histogram[RT_MAX_REF_ENTITY_TYPE] = {};
-        for (const refEntity_t &entity : pendingEntities) {
+        for (const PendingEntity &pending : pendingEntities) {
+            const refEntity_t &entity = pending.entity;
             if (entity.reType >= 0 && entity.reType < RT_MAX_REF_ENTITY_TYPE) {
                 histogram[entity.reType]++;
             }
@@ -6576,19 +7030,25 @@ void UploadPendingSceneGeometry()
     UploadWorldOverlayGeometry();
 
     const int skipMask = qraySkipEntities != nullptr ? qraySkipEntities->integer : 0;
-    for (const refEntity_t &entity : pendingEntities) {
+    if ((skipMask & 8) == 0) {
+        for (const PendingPoly &poly : pendingPolys) {
+            UploadPolyGeometry(poly);
+        }
+    }
+    for (const PendingEntity &pending : pendingEntities) {
+        const refEntity_t &entity = pending.entity;
         if ((entity.renderfx & RF_THIRD_PERSON) != 0) {
             continue;
         }
         switch (entity.reType) {
         case RT_MODEL:
             if ((skipMask & 1) == 0) {
-                UploadModelEntity(entity);
+                UploadModelEntity(entity, pending.shaderTimeSeconds);
             }
             break;
         case RT_SPRITE:
             if ((skipMask & 2) == 0) {
-                UploadSpriteEntity(entity);
+                UploadSpriteEntity(entity, pending.shaderTimeSeconds);
             }
             break;
         case RT_BEAM:
@@ -6604,11 +7064,6 @@ void UploadPendingSceneGeometry()
             break;
         default:
             break;
-        }
-    }
-    if ((skipMask & 8) == 0) {
-        for (const PendingPoly &poly : pendingPolys) {
-            UploadPolyGeometry(poly);
         }
     }
     if (qrayTestQuad != nullptr && qrayTestQuad->integer != 0) {
@@ -7302,14 +7757,18 @@ void ClearScene()
 
 void AddRefEntityToScene(const refEntity_t *entity, qboolean intShaderTime)
 {
-    (void)intShaderTime;
     if (entity == nullptr) {
         return;
     }
     if (pendingEntities.size() >= 16384) {
         return;
     }
-    pendingEntities.push_back(*entity);
+    PendingEntity pending{};
+    pending.entity = *entity;
+    pending.shaderTimeSeconds = intShaderTime != qfalse
+        ? static_cast<float>(entity->shaderTime.i) * 0.001f
+        : entity->shaderTime.f;
+    pendingEntities.push_back(pending);
 }
 
 void AddPolyToScene(qhandle_t shader, int numVerts, const polyVert_t *verts, int num)

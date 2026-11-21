@@ -359,8 +359,8 @@ point of one.
 | `qray_whitePoint` | `20.0` | Luminance mapped to white, higher values keep more highlights. |
 | `qray_exposureBias` | `0` | Exposure bias in stops applied by QuakeRay. |
 | `qray_eyeAdaptation` | `0` | Let QuakeRay adapt exposure to the frame. Retail had a fixed exposure, and adaptation also makes measurements drift between frames, so it is off by default. |
-| `qray_overlayScale` | `2.0` | HDR luminance multiplier for opaque and alpha-blended world shader overlays. |
-| `qray_overlayAddScale` | `24.0` | HDR luminance multiplier for additive and emissive world shader overlays (torches, jump pads, lava). |
+| `qray_overlayScale` | `1.0` | HDR luminance multiplier for opaque and alpha-blended world shader overlays. |
+| `qray_overlayAddScale` | `1.5` | HDR luminance multiplier for additive and emissive world shader overlays (torches, jump pads, lava). |
 
 ## Animated world overlays and surface lights
 
